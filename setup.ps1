@@ -1,103 +1,56 @@
-# OLAS — Open Local Audio Scribe (Windows) — portable setup script
+# OLAS — Open Local Audio Scribe (Windows) — build preparation
 #
-# Downloads Moonshine runtime + ONNX Runtime + language models into a
-# self-contained folder. No admin rights needed. Idempotent: re-run to
-# repair or update.
+# Prepares a checkout of OLAS 1.1 so it can be configured and built:
+#
+#   1. verifies the toolchain (CMake, git, a C++ compiler, tar)
+#   2. fetches the models the app can load, into .\models\
+#   3. reports what CMake needs and how to run it
+#
+# Idempotent: re-run any time to repair or top up.
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File setup.ps1
-#   powershell -ExecutionPolicy Bypass -File setup.ps1 -InstallDir D:\OLAS
-#   powershell -ExecutionPolicy Bypass -File setup.ps1 -Languages en,es,ja
+#   powershell -ExecutionPolicy Bypass -File setup.ps1 -Force
+#   powershell -ExecutionPolicy Bypass -File setup.ps1 -SkipModels
+#
+# A release build bundles the models, so end users never run this. It is for
+# building from source.
 
 [CmdletBinding()]
 param(
-    [string]$InstallDir = "$env:LOCALAPPDATA\OLAS",
     [string[]]$Languages = @("en", "es"),
-    [string]$MoonshineVersion = "latest",
-    [string]$OnnxRuntimeVersion = "1.24.4",
     [switch]$SkipModels,
     [switch]$Force
 )
 
 $ErrorActionPreference = "Stop"
-$ProgressPreference = "Continue"
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-$MoonshineUrl = if ($MoonshineVersion -eq "latest") {
-    "https://github.com/moonshine-ai/moonshine/releases/latest/download/moonshine-voice-windows-x86_64.tar.gz"
-} else {
-    "https://github.com/moonshine-ai/moonshine/releases/download/$MoonshineVersion/moonshine-voice-windows-x86_64.tar.gz"
-}
-
-$OnnxUrl = "https://github.com/microsoft/onnxruntime/releases/download/v$OnnxRuntimeVersion/onnxruntime-win-x64-$OnnxRuntimeVersion.zip"
-
-# Per-language model download base. Moonshine publishes quantized .ort models at
-# a stable CDN path.
-function Get-ModelBase([string]$lang) {
-    return "https://download.moonshine.ai/model/base-$lang/quantized/base-$lang"
-}
-
-# Model components (non-streaming Base architecture).
-$ModelFiles = @("encoder_model.ort", "decoder_model_merged.ort", "tokenizer.bin")
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 function Write-Step([string]$msg) {
     Write-Host ""
     Write-Host "==> $msg" -ForegroundColor Cyan
 }
-
-function Write-Ok([string]$msg) {
-    Write-Host "    [ok] $msg" -ForegroundColor Green
-}
-
-function Write-Warn([string]$msg) {
-    Write-Host "    [warn] $msg" -ForegroundColor Yellow
-}
-
-function Download-File([string]$url, [string]$dest) {
-    Write-Host "    downloading $url"
-    $tmp = "$dest.part"
-    if (Test-Path $tmp) { Remove-Item $tmp -Force }
-    try {
-        Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing -ErrorAction Stop
-        Move-Item $tmp $dest -Force
-    } catch {
-        if (Test-Path $tmp) { Remove-Item $tmp -Force }
-        throw "download failed: $url`n  $($_.Exception.Message)"
-    }
-}
-
-function Expand-TarGz([string]$archive, [string]$destDir) {
-    # Windows 10 1803+ ships bsdtar as tar.exe.
-    $tar = Get-Command tar.exe -ErrorAction SilentlyContinue
-    if (-not $tar) {
-        throw "tar.exe not found; Windows 10 1803 or newer is required."
-    }
-    New-Item -ItemType Directory -Force -Path $destDir | Out-Null
-    & $tar.Source -xzf $archive -C $destDir
-    if ($LASTEXITCODE -ne 0) { throw "tar extraction failed for $archive" }
-}
-
-function Expand-Zip([string]$archive, [string]$destDir) {
-    New-Item -ItemType Directory -Force -Path $destDir | Out-Null
-    Expand-Archive -Path $archive -DestinationPath $destDir -Force
-}
+function Write-Ok([string]$msg)   { Write-Host "    [ok] $msg" -ForegroundColor Green }
+function Write-Warn([string]$msg) { Write-Host "    [warn] $msg" -ForegroundColor Yellow }
+function Write-Err([string]$msg)  { Write-Host "    [err] $msg" -ForegroundColor Red }
 
 function Find-Tool([string]$name) {
     return (Get-Command $name -ErrorAction SilentlyContinue)
 }
 
+# Script lives at the repo root.
+$Root = $PSScriptRoot
+if (-not $Root) { $Root = Split-Path -Parent $MyInvocation.MyCommand.Path }
+Set-Location $Root
+
+Write-Host ""
+Write-Host "OLAS 1.1 - build preparation" -ForegroundColor Cyan
+Write-Host "repository: $Root"
+
 # ---------------------------------------------------------------------------
-# Preflight
+# 1. Toolchain
 # ---------------------------------------------------------------------------
 
-Write-Step "Checking prerequisites"
+Write-Step "Checking the toolchain"
 
 if ($PSVersionTable.PSVersion.Major -lt 5) {
     throw "PowerShell 5.1 or newer is required."
@@ -105,184 +58,127 @@ if ($PSVersionTable.PSVersion.Major -lt 5) {
 
 $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
 if ($arch -ne "X64") {
-    Write-Warn "Windows $arch detected; only x64 binaries are published."
+    Write-Warn "Windows $arch detected; only x64 builds are supported."
 }
 
-New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-$InstallDir = (Resolve-Path $InstallDir).Path
-Write-Ok "install dir: $InstallDir"
+$missing = @()
 
-$CacheDir = Join-Path $InstallDir ".cache"
-New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
-
-# ---------------------------------------------------------------------------
-# 1. Moonshine runtime library
-# ---------------------------------------------------------------------------
-
-Write-Step "Installing Moonshine runtime"
-
-$moonshineDir = Join-Path $InstallDir "moonshine-voice"
-$moonshineTarball = Join-Path $CacheDir "moonshine-voice-windows-x86_64.tar.gz"
-
-if ((Test-Path $moonshineDir) -and -not $Force) {
-    Write-Ok "moonshine-voice already present (use -Force to reinstall)"
+if (Find-Tool cmake) {
+    $cmakeVer = (& cmake --version | Select-Object -First 1)
+    Write-Ok "$cmakeVer"
 } else {
-    if (-not (Test-Path $moonshineTarball) -or $Force) {
-        Download-File $MoonshineUrl $moonshineTarball
-    }
-    if (Test-Path $moonshineDir) { Remove-Item $moonshineDir -Recurse -Force }
-    Expand-TarGz $moonshineTarball $InstallDir
-    if (Test-Path $moonshineDir) {
-        Write-Ok "moonshine-voice extracted"
-    } else {
-        # Tarball may extract with a versioned folder name; find and rename.
-        $candidates = Get-ChildItem $InstallDir -Directory |
-            Where-Object { $_.Name -like "moonshine*" -and $_.Name -ne "moonshine-voice" }
-        if ($candidates) {
-            Rename-Item $candidates[0].FullName $moonshineDir
-            Write-Ok "moonshine-voice renamed from $($candidates[0].Name)"
-        } else {
-            throw "moonshine-voice directory not found after extraction"
-        }
-    }
+    $missing += "cmake"
+    Write-Err "CMake not found. Install from https://cmake.org/download/ or 'winget install Kitware.CMake'."
 }
 
-# ---------------------------------------------------------------------------
-# 2. ONNX Runtime
-# ---------------------------------------------------------------------------
-
-Write-Step "Installing ONNX Runtime $OnnxRuntimeVersion"
-
-$onnxDir = Join-Path $InstallDir "onnxruntime"
-$onnxZip = Join-Path $CacheDir "onnxruntime-win-x64-$OnnxRuntimeVersion.zip"
-
-if ((Test-Path $onnxDir) -and -not $Force) {
-    Write-Ok "onnxruntime already present (use -Force to reinstall)"
+if (Find-Tool git) {
+    Write-Ok "git present (CMake uses it to fetch Moonshine)"
 } else {
-    if (-not (Test-Path $onnxZip) -or $Force) {
-        Download-File $OnnxUrl $onnxZip
-    }
-    $tmpExtract = Join-Path $CacheDir "onnx-extract"
-    if (Test-Path $tmpExtract) { Remove-Item $tmpExtract -Recurse -Force }
-    Expand-Zip $onnxZip $tmpExtract
+    $missing += "git"
+    Write-Err "git not found. Install from https://git-scm.com/ or 'winget install Git.Git'."
+}
 
-    # The zip contains onnxruntime-win-x64-<version>/ with lib/ and include/.
-    $inner = Get-ChildItem $tmpExtract -Directory | Select-Object -First 1
-    if (-not $inner) { throw "unexpected onnxruntime zip layout" }
+if (Find-Tool tar.exe) {
+    Write-Ok "tar.exe present"
+} else {
+    $missing += "tar"
+    Write-Err "tar.exe not found; Windows 10 1803 or newer is required."
+}
 
-    if (Test-Path $onnxDir) { Remove-Item $onnxDir -Recurse -Force }
-    New-Item -ItemType Directory -Force -Path $onnxDir | Out-Null
-    Copy-Item (Join-Path $inner.FullName "lib\*")       $onnxDir -Recurse -Force
-    Copy-Item (Join-Path $inner.FullName "include\*")   $onnxDir -Recurse -Force
-    Remove-Item $tmpExtract -Recurse -Force
-    Write-Ok "onnxruntime installed"
+# A C++ toolchain. CMake will look for MSVC or MinGW itself; this is a hint.
+if (Find-Tool cl) {
+    Write-Ok "MSVC cl.exe on PATH"
+} elseif (Find-Tool g++) {
+    Write-Ok "g++ on PATH (MinGW)"
+} else {
+    Write-Warn "No C++ compiler on PATH. CMake can still find MSVC through"
+    Write-Warn "Visual Studio, but the 'Desktop development with C++' workload"
+    Write-Warn "must be installed:"
+    Write-Warn "  winget install Microsoft.VisualStudio.2022.BuildTools"
+}
+
+if ($missing.Count -gt 0) {
+    Write-Host ""
+    Write-Err "Install the missing tool(s) above, then re-run this script."
+    exit 1
 }
 
 # ---------------------------------------------------------------------------
-# 3. Language models
+# 2. Models
 # ---------------------------------------------------------------------------
+
+$modelsDir = Join-Path $Root "models"
 
 if ($SkipModels) {
     Write-Step "Skipping model download (-SkipModels)"
 } else {
-    $modelsDir = Join-Path $InstallDir "models"
-    New-Item -ItemType Directory -Force -Path $modelsDir | Out-Null
+    Write-Step "Fetching models"
 
-    foreach ($lang in $Languages) {
-        Write-Step "Installing model base-$lang"
-        $langDir = Join-Path $modelsDir "base-$lang"
-        $baseUrl = Get-ModelBase $lang
+    # Delegate to the one script that knows the model layout and the CDN
+    # folder probing, so there is a single source of truth. -Set all gets
+    # every model the app can load, so both modes work offline.
+    $fetch = Join-Path $Root "tools\fetch-streaming-models.ps1"
+    if (-not (Test-Path $fetch)) {
+        throw "tools\fetch-streaming-models.ps1 not found; is this the repo root?"
+    }
 
-        # Validate language against the known set to fail fast.
-        if ($lang -notmatch '^(en|es|ar|ja|ko|zh|vi|uk)$') {
-            Write-Warn "unknown language '$lang'; skipping"
-            continue
-        }
+    $fetchArgs = @{
+        Languages = $Languages
+        Set       = "all"
+    }
+    if ($Force) { $fetchArgs["Force"] = $true }
 
-        New-Item -ItemType Directory -Force -Path $langDir | Out-Null
+    & $fetch @fetchArgs
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err "model fetch failed (exit $LASTEXITCODE)"
+        exit 1
+    }
 
-        $missing = @()
-        foreach ($f in $ModelFiles) {
-            if (-not (Test-Path (Join-Path $langDir $f)) -or $Force) {
-                $missing += $f
-            }
-        }
-
-        if ($missing.Count -eq 0) {
-            Write-Ok "base-$lang already complete"
-            continue
-        }
-
-        foreach ($f in $missing) {
-            $dest = Join-Path $langDir $f
-            Download-File "$baseUrl/$f" $dest
-            $size = (Get-Item $dest).Length
-            Write-Ok "base-$lang/$f ($([math]::Round($size/1MB,1)) MB)"
-        }
-
-        # Sanity check: tokenizer.bin is tiny but must be present.
-        if (-not (Test-Path (Join-Path $langDir "tokenizer.bin"))) {
-            Write-Warn "base-$lang is missing tokenizer.bin — model may not load"
-        }
+    if (-not (Test-Path $modelsDir)) {
+        Write-Err "models\ was not created; model fetch failed."
+        Write-Err "Run it directly to see the error:"
+        Write-Err "  powershell -ExecutionPolicy Bypass -File tools\fetch-streaming-models.ps1"
+        exit 1
     }
 }
 
 # ---------------------------------------------------------------------------
-# 4. Launcher
+# 3. Report
 # ---------------------------------------------------------------------------
 
-Write-Step "Writing launcher"
+Write-Step "Model inventory"
 
-$exe = Join-Path $InstallDir "olas_win.exe"
-$launcher = Join-Path $InstallDir "OLAS.bat"
+$expected = @(
+    @{ dir = "medium-streaming-en"; mode = "Normal mode (English)" },
+    @{ dir = "small-streaming-en";  mode = "Potato mode (English)" },
+    @{ dir = "small-streaming-es";  mode = "Spanish (both modes)"  }
+)
 
-$modelArgs = ($Languages | ForEach-Object { "models\base-$_" }) -join ","
-$langArgs  = ($Languages -join ",")
-
-$bat = @"
-@echo off
-setlocal
-cd /d "%~dp0"
-set PATH=%~dp0onnxruntime;%PATH%
-"%~dp0olas_win.exe" -l $langArgs -m "$modelArgs"
-endlocal
-"@
-
-Set-Content -Path $launcher -Value $bat -Encoding ASCII
-Write-Ok "launcher: $launcher"
-
-# ---------------------------------------------------------------------------
-# 5. Desktop shortcut (best-effort, no admin)
-# ---------------------------------------------------------------------------
-
-Write-Step "Creating desktop shortcut"
-
-try {
-    $ws = New-Object -ComObject WScript.Shell
-    $lnk = $ws.CreateShortcut((Join-Path ([Environment]::GetFolderPath("Desktop")) "OLAS.lnk"))
-    $lnk.TargetPath       = $launcher
-    $lnk.WorkingDirectory = $InstallDir
-    $lnk.IconLocation     = "$exe,0"
-    $lnk.Description      = "OLAS — Open Local Audio Scribe"
-    $lnk.Save()
-    Write-Ok "desktop shortcut created"
-} catch {
-    Write-Warn "could not create desktop shortcut: $($_.Exception.Message)"
+foreach ($e in $expected) {
+    $p = Join-Path $modelsDir $e.dir
+    $cfg = Join-Path $p "streaming_config.json"
+    if (Test-Path $cfg) {
+        $sizeMB = [math]::Round(
+            ((Get-ChildItem $p -File | Measure-Object -Property Length -Sum).Sum / 1MB), 1)
+        Write-Ok "$($e.dir)  ($sizeMB MB)  - $($e.mode)"
+    } else {
+        Write-Warn "$($e.dir) missing - $($e.mode) will not work"
+    }
 }
 
-# ---------------------------------------------------------------------------
-# Done
-# ---------------------------------------------------------------------------
-
 Write-Host ""
-Write-Host "OLAS is installed in: $InstallDir" -ForegroundColor Green
+Write-Host "Preparation complete." -ForegroundColor Green
 Write-Host ""
-Write-Host "Run it by double-clicking OLAS.bat or the desktop shortcut." -ForegroundColor Green
+Write-Host "Configure and build:" -ForegroundColor Cyan
+Write-Host "    mkdir build"
+Write-Host "    cd build"
+Write-Host "    cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DONNXRUNTIME_MODE=bundled .."
+Write-Host "    cmake --build . --config Release -j"
 Write-Host ""
-if (Test-Path $exe) {
-    Write-Host "Main executable: $exe"
-} else {
-    Write-Warn "olas_win.exe is not present yet."
-    Write-Warn "Place your compiled olas_win.exe next to this script and re-run,"
-    Write-Warn "or build it per README.md and copy it into $InstallDir."
-}
+Write-Host "The first configure takes 5-15 minutes: it fetches the Moonshine"
+Write-Host "sources and builds ONNX Runtime from them."
+Write-Host ""
+Write-Host "Then run:  .\OLAS.bat      (or build\olas_win.exe from the build dir)"
+Write-Host ""
+Write-Host "On first launch OLAS asks whether to use Normal mode (Medium"
+Write-Host "English) or Potato mode (Small English)."

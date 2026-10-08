@@ -3,8 +3,8 @@
 param(
     [string[]]$Languages = @("en", "es"),
     [string]$Version = "",
-    [ValidateSet("default", "small", "medium")]
-    [string]$Set = "default",
+    [ValidateSet("default", "small", "medium", "all")]
+    [string]$Set = "all",
     [switch]$Force
 )
 
@@ -25,16 +25,33 @@ if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.P
 $root = Split-Path -Parent $scriptDir
 $modelsRoot = Join-Path $root "models"
 
-# ---- per-language model family (matches the app defaults) ----
-# The Windows app defaults English to Medium Streaming (arch 5) and every
-# other language to Small Streaming (arch 4), so the default fetch set is
-# medium-streaming-en + small-streaming-<lang> for the rest. Override per
-# language with -Set small|medium (applies to every requested language).
-function Get-Family([string]$lang) {
+# ---- per-language model family ----
+#
+# OLAS 1.1 has two modes and both must work offline, so the default fetch set
+# (-Set all) is every model the app can load:
+#
+#   medium-streaming-en   Normal mode, English
+#   small-streaming-en    Potato mode, English
+#   small-streaming-<x>   every other language (only Small exists)
+#
+# -Set default fetches just what Normal mode needs (medium English, small
+# others); -Set small or -Set medium forces one family everywhere.
+#
+# Get-Families returns a list because -Set all yields two entries for English.
+# Note: no ternary operator here. The script declares #Requires -Version 5.1
+# and PS 5.1 has no `? :`, only PS 7+ does.
+function Get-Families([string]$lang) {
     switch ($Set) {
-        "small"  { return "small-streaming" }
-        "medium" { return "medium-streaming" }
-        default  { return ($lang -eq "en") ? "medium-streaming" : "small-streaming" }
+        "small"  { return @("small-streaming") }
+        "medium" { return @("medium-streaming") }
+        "default" {
+            if ($lang -eq "en") { return @("medium-streaming") }
+            return @("small-streaming")
+        }
+        default {
+            if ($lang -eq "en") { return @("medium-streaming", "small-streaming") }
+            return @("small-streaming")
+        }
     }
 }
 
@@ -90,8 +107,7 @@ function Resolve-Version([string]$family, [string]$lang, [string]$explicit) {
           "and add the current folder name to `$KnownVersions at the top of this script."
 }
 
-function Fetch-Model([string]$lang, [string]$forcedVersion) {
-    $family  = Get-Family $lang
+function Fetch-Model([string]$family, [string]$lang, [string]$forcedVersion) {
     $version = Resolve-Version $family $lang $forcedVersion
     $base = "https://download.moonshine.ai/model/$family-$lang/$version"
     $dst  = Join-Path $modelsRoot "$family-$lang"
@@ -125,16 +141,20 @@ function Fetch-Model([string]$lang, [string]$forcedVersion) {
     }
 }
 
-Write-Host "Fetching streaming models into $modelsRoot"
+Write-Host "Fetching streaming models into $modelsRoot (set: $Set)"
+$wanted = @()
 foreach ($lang in $Languages) {
-    Fetch-Model $lang $Version
+    foreach ($family in (Get-Families $lang)) {
+        $wanted += ,@($family, $lang)
+        Fetch-Model $family $lang $Version
+    }
 }
 
 Write-Host ""
 Write-Host "Verifying..." -ForegroundColor Cyan
 $all_ok = $true
-foreach ($lang in $Languages) {
-    $family = Get-Family $lang
+foreach ($pair in $wanted) {
+    $family = $pair[0]; $lang = $pair[1]
     $dst = Join-Path $modelsRoot "$family-$lang"
     foreach ($f in $Files) {
         $p = Join-Path $dst $f
@@ -149,9 +169,16 @@ Write-Host ""
 if ($all_ok) {
     Write-Host "All model files present." -ForegroundColor Green
     Write-Host ""
-    Write-Host "Run the app with:"
+    Write-Host "Models ready. Run the app with:"
     Write-Host "    cd `"$root`""
-    Write-Host "    .\olas_win.exe -l $($Languages -join ',') -v"
+    Write-Host "    .\OLAS.bat"
+    Write-Host ""
+    Write-Host "First launch asks whether to use Normal mode (Medium English)"
+    Write-Host "or Potato mode (Small English)."
+    Write-Host ""
+    Write-Host "Normal mode needs medium-streaming-en; Potato mode needs"
+    Write-Host "small-streaming-en. -Set all (the default) fetches both, so"
+    Write-Host "the choice works offline either way."
 } else {
     Write-Host "Some files are missing. Re-run with -Force to redownload." -ForegroundColor Yellow
     exit 1

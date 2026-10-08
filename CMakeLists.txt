@@ -278,9 +278,14 @@ add_custom_target(dist
     # Runtime DLL
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${ORT_DLL_SOURCE}" "${DIST_DIR}/onnxruntime.dll"
-    # Models: whatever fetch-streaming-models.ps1 put in models/
-    COMMAND ${CMAKE_COMMAND} -E copy_directory
-            "${CMAKE_SOURCE_DIR}/models" "${DIST_DIR}/models"
+    # Models. A release build ships all three so both modes work offline;
+    # run setup.ps1 (or tools\fetch-streaming-models.ps1) first. The target
+    # still succeeds without them, with a warning, so a build is never
+    # blocked by a missing download.
+    COMMAND ${CMAKE_COMMAND}
+            -DMODELS_SRC=${CMAKE_SOURCE_DIR}/models
+            -DDIST_DIR=${DIST_DIR}
+            -P ${CMAKE_SOURCE_DIR}/cmake/copy-models.cmake
     # Launcher + docs
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/OLAS.bat"   "${DIST_DIR}/OLAS.bat"
@@ -288,7 +293,8 @@ add_custom_target(dist
             "${CMAKE_SOURCE_DIR}/README.md"  "${DIST_DIR}/README.md"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/LICENSE"    "${DIST_DIR}/LICENSE"
-    # 0.6 runtime tuning (transcription parameters)
+    # Runtime tuning (transcription parameters); shipped as a default the
+    # user can edit or delete.
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/olas-win.conf" "${DIST_DIR}/olas-win.conf"
     DEPENDS olas_win

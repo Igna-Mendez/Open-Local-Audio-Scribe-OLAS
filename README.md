@@ -313,10 +313,13 @@ Moonshine sources are pulled via `FetchContent` on first configure.
 
 **Build**
 
+Run `setup.ps1` first. It checks the toolchain, fetches all three models into
+`models\`, and prints the exact configure command:
+
 ```bat
 git clone https://github.com/Igna-Mendez/Open-Local-Audio-Scribe-OLAS.git
 cd Open-Local-Audio-Scribe-OLAS
-powershell -ExecutionPolicy Bypass -File tools\fetch-streaming-models.ps1
+powershell -ExecutionPolicy Bypass -File setup.ps1
 
 mkdir build
 cd build
@@ -324,16 +327,27 @@ cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DONNXRUNTIME_MODE=bundled ..
 cmake --build . --config Release -j
 ```
 
-Produces `build\olas_win.exe`. First configure takes 5–15 minutes (ONNX Runtime
-is built from source); subsequent builds are seconds.
+Produces `build\olas_win.exe`. First configure takes 5–15 minutes: it fetches
+the Moonshine sources and builds ONNX Runtime from them. Subsequent builds are
+seconds.
+
+`setup.ps1` is idempotent — re-run it any time to repair or top up. It is only
+needed for source builds; the release zip already contains the models.
+
+Options: `-Force` (re-download), `-SkipModels`, `-Languages en,es`.
 
 **Build a release zip**
+
+The `zip` target packages the exe, `onnxruntime.dll`, the models, the launcher
+and the docs into one archive, so an end user needs nothing beyond the zip.
+Run `setup.ps1` first so the models are present:
 
 ```bat
 cmake --build . --config Release --target zip -j
 ```
 
-Creates `build\dist\OLAS-win64-<version>.zip`.
+Creates `build\dist\OLAS-win64-<version>.zip`. If `models\` is empty the
+package still builds, with a warning — but it will not be runnable.
 
 **Cross-compile (Linux to Windows)**
 
