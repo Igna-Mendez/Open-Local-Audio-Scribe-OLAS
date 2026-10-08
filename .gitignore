@@ -52,9 +52,11 @@ olas_win.exe
 models/
 
 # ---------------------------------------------------------------------------
-# Runtime notes file written by OLAS
+# Runtime state written by OLAS (per-user, never committed or shipped)
 # ---------------------------------------------------------------------------
 olas-moonshine-notes.txt
+olas-debug.log
+olas-model.txt
 
 # ---------------------------------------------------------------------------
 # IDE / editor
