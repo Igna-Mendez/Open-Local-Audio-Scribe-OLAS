@@ -185,13 +185,47 @@ if(NOT EXISTS "${MOONSHINE_LIB_DIR}/moonshine.lib")
     message(FATAL_ERROR "moonshine.lib not found under ${MOONSHINE_LIB_DIR}")
 endif()
 
-# Imported target for the SDK, so the rest of this file and the linker only
-# need one name.
-add_library(moonshine_sdk SHARED IMPORTED GLOBAL)
-set_target_properties(moonshine_sdk PROPERTIES
-    IMPORTED_IMPLIB        "${MOONSHINE_LIB_DIR}/moonshine.lib"
-    IMPORTED_LOCATION      "${MOONSHINE_LIB_DIR}/moonshine.dll"
-    INTERFACE_INCLUDE_DIRECTORIES "${MOONSHINE_INCLUDE_DIR}")
+# The SDK is a set of STATIC libraries: moonshine.lib is ~129 MB of object
+# code and there is no moonshine.dll. Link all of it.
+#
+# moonshine.lib is the main archive, but it does not carry everything. Its
+# members reference symbols that live in its siblings, so linking only
+# moonshine.lib leaves ~50 unresolved externals (OrtGetApiBase,
+# ort_session_from_path, ort_run, BinTokenizer, FileInformation, trim, split,
+# ...). The mapping:
+#
+#   moonshine.lib       the library itself
+#   moonshine-utils.lib string/path helpers, FileInformation
+#   ort-utils.lib       ort_session_from_path, ort_run, OrtGetApiBase wrappers
+#   bin-tokenizer.lib   BinTokenizer
+#   onnxruntime.lib     import library for the onnxruntime.dll that ships here
+#
+# Static libs must be listed in dependency order for the linker to resolve
+# symbols in one pass, and onnxruntime.lib sits last because it is the DLL
+# import library the others ultimately call into.
+set(_moonshine_libs
+    "${MOONSHINE_LIB_DIR}/moonshine.lib"
+    "${MOONSHINE_LIB_DIR}/moonshine-utils.lib"
+    "${MOONSHINE_LIB_DIR}/ort-utils.lib"
+    "${MOONSHINE_LIB_DIR}/bin-tokenizer.lib"
+)
+
+foreach(_lib ${_moonshine_libs})
+    if(NOT EXISTS "${_lib}")
+        message(FATAL_ERROR
+            "The Moonshine SDK is missing ${_lib}.\n"
+            "Expected moonshine.lib and its companions under "
+            "${MOONSHINE_LIB_DIR}. Delete ${MOONSHINE_SDK_DIR} and "
+            "reconfigure to re-fetch, or point -DMOONSHINE_SDK_DIR at a "
+            "complete SDK.")
+    endif()
+endforeach()
+
+add_library(moonshine_sdk INTERFACE)
+target_include_directories(moonshine_sdk INTERFACE "${MOONSHINE_INCLUDE_DIR}")
+target_link_libraries(moonshine_sdk INTERFACE
+    ${_moonshine_libs}
+    "${MOONSHINE_LIB_DIR}/onnxruntime.lib")
 
 message(STATUS "OLAS: Moonshine SDK at ${MOONSHINE_SDK_DIR}")
 
