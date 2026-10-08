@@ -427,15 +427,23 @@ int main() {
     capture_stop();
     if (cap_thread.joinable()) cap_thread.join();
 
-    engine.stop();          // stop() now flushes in-progress segments itself.
+    // Read the counters before stopping: stop() clears the slots, so
+    // get_stats() would return zeros afterwards.
+    std::vector<Engine::Stats> stats;
+    if (g_show_stats) {
+        for (size_t i = 0; i < languages.size() && i < engine.size(); ++i)
+            stats.push_back(engine.get_stats((int)i));
+    }
+
+    engine.stop();
     g_engine = nullptr;
 
     win32_ui_shutdown();
     capture_uninit();
 
     if (g_show_stats) {
-        for (size_t i = 0; i < languages.size() && i < engine.size(); ++i) {
-            const auto st = engine.get_stats((int)i);
+        for (size_t i = 0; i < languages.size() && i < stats.size(); ++i) {
+            const auto st = stats[i];
             std::fprintf(stderr, "\n=== Slot %zu (%s) ===\n", i, languages[i].c_str());
             std::fprintf(stderr, "  chunks_pushed      : %llu\n",
                          (unsigned long long)st.chunks_pushed);

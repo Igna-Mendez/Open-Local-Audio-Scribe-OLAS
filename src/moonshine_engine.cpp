@@ -318,6 +318,18 @@ public:
         return dropped_;
     }
 
+    // Stop the worker now, discarding anything still queued.
+    //
+    // close() is the graceful form: the worker keeps draining until the queue
+    // is empty. That is right when the goal is to finish the audio, and wrong
+    // when the user has asked to quit and the backlog is a minute long.
+    void abandon() {
+        std::lock_guard<std::mutex> lk(mutex_);
+        queue_.clear();
+        closed_ = true;
+        cv_.notify_all();
+    }
+
     void close() {
         std::lock_guard<std::mutex> lk(mutex_);
         closed_ = true;
@@ -1028,14 +1040,20 @@ void Engine::start() {
 
 void Engine::stop() {
     if (!impl_) return;
+
+    // Abandon whatever is still queued instead of decoding it.
+    //
+    // close() alone lets the worker drain the backlog first, and the backlog
+    // can be up to MAX_QUEUE_CHUNKS (~60 s of audio). Decoding a minute of
+    // speech that is about to be discarded, on the thread that owns the
+    // message loop, is what made the window stop responding on close. The
+    // transcript for audio already processed is on screen and in the notes
+    // file; only the pending backlog is dropped, and the user asked to quit.
     for (auto &s : impl_->slots) {
-        if (s->queue) s->queue->close();
+        if (s->queue) s->queue->abandon();
     }
     for (auto &s : impl_->slots) {
         if (s->thread.joinable()) s->thread.join();
-    }
-    for (auto &s : impl_->slots) {
-        try { s->flush(); } catch (...) {}
     }
     impl_->slots.clear();
 }

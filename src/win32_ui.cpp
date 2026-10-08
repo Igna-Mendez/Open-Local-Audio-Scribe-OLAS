@@ -1294,8 +1294,19 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
 
         case WM_CLOSE:
+            // Bring any decoupled panes back first: a float window left open
+            // would keep the process alive after the main window goes.
             for (auto &pp : g_panes)
                 if (pp->float_window) pane_reattach(pp.get());
+
+            // Take the window down now, so it disappears the moment the user
+            // clicks X. The engine teardown that follows can take a moment
+            // (it joins the worker threads); doing that while the window was
+            // still on screen is what made Windows report "not responding".
+            DestroyWindow(hwnd);
+            g_main_window = nullptr;
+
+            // Quit regardless of what the teardown above did.
             PostQuitMessage(0);
             return 0;
 
