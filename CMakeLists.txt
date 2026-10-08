@@ -7,6 +7,14 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# MSVC needs an explicit switch before <stdatomic.h> provides the atomic types.
+# /std:c11 alone is not enough and capture.c dies with
+# "fatal error C1189: C atomic support is not enabled". GCC and Clang need
+# nothing, which is why this only shows up on the MSVC build.
+if(MSVC)
+    add_compile_options(/experimental:c11atomics)
+endif()
+
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
