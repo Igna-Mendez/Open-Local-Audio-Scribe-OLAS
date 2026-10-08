@@ -860,6 +860,10 @@ struct Engine::Impl {
         std::shared_ptr<std::atomic<bool>>    need_reset;
         std::shared_ptr<std::atomic<int64_t>> disabled_at_ns;
 
+        // Core window this slot's worker (and its ORT pool) is confined to.
+        int plan_first = 0;
+        int plan_cores = 0;
+
         SlotCounters counters;
 
         void feed_pcm(const std::vector<int16_t> &pcm) {
@@ -916,6 +920,12 @@ struct Engine::Impl {
         s.queue = std::make_unique<AudioQueue>();
         AudioQueue *q = s.queue.get();
         s.thread = std::thread([&s, q] {
+            // Put this worker on its model's cores. addAudio() runs here, so
+            // this thread's affinity is what actually decides where the
+            // decode work lands.
+            if (s.plan_cores > 0)
+                pin_current_thread(s.plan_first, s.plan_cores);
+
             std::shared_ptr<const std::vector<int16_t>> chunk;
             uint64_t seq = 0;
             while (q->pop(chunk)) {
@@ -989,10 +999,15 @@ void Engine::start() {
         s->need_reset      = std::make_shared<std::atomic<bool>>(false);
         s->disabled_at_ns  = std::make_shared<std::atomic<int64_t>>(-1);
 
-        // Confine this thread to the model's own cores while its session is
-        // built, so the two models do not contend for one pool.
+        // Confine THIS thread to the model's own cores while its session is
+        // built. Windows gives a new thread the affinity of the thread that
+        // created it, so the ONNX Runtime worker threads this session spawns
+        // inherit exactly this set. That is what keeps the two models off
+        // each other's cores.
         const int want = (i < impl_->plan.model_cores.size())
                              ? impl_->plan.model_cores[i] : 0;
+        s->plan_first  = core_cursor;
+        s->plan_cores  = want;
         if (want > 0) {
             pin_current_thread(core_cursor, want);
             core_cursor += want;
@@ -1002,9 +1017,11 @@ void Engine::start() {
         impl_->slots.push_back(std::move(s));
     }
 
-    // Widen back so capture and UI are not stuck on one model's cores.
-    if (impl_->plan.pin_affinity && impl_->plan.total_cores > 0)
-        pin_process(impl_->plan.total_cores);
+    // Lift the restriction from this (the main) thread. Per-thread on
+    // purpose: SetProcessAffinityMask would rewrite the masks of the ORT
+    // threads just created and undo the split above.
+    if (impl_->plan.pin_affinity)
+        unpin_current_thread();
 
     for (auto &s : impl_->slots) impl_->start_thread(*s);
 }

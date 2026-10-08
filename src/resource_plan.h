@@ -1,5 +1,10 @@
 #pragma once
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
 #include <string>
 #include <vector>
 
@@ -45,11 +50,17 @@ ResourcePlan plan_resources(int models,
 
 // Restrict the calling thread to `count` logical CPUs starting at `first`.
 // Used before each transcriber is built so its ORT session sizes its pool
-// from that set. Returns false if Windows refused.
+// from that set. New threads inherit the creating thread's mask on Windows,
+// so anything ORT spawns inside that window lands on the same cores.
 bool pin_current_thread(int first, int count);
 
-// Restrict the whole process to `count` CPUs from 0. Called after all
-// transcribers exist so capture and UI are not confined to one model's share.
-bool pin_process(int count);
+// Restrict a specific thread. Used to put each worker on its model's cores,
+// since the worker is where addAudio() runs.
+bool pin_thread(HANDLE thread, int first, int count);
+
+// Lift the affinity restriction from the calling thread, leaving its own
+// mask as wide as the process allows. Deliberately per-thread: see the note
+// in resource_plan.cpp for why SetProcessAffinityMask is not used.
+bool unpin_current_thread();
 
 } // namespace olas

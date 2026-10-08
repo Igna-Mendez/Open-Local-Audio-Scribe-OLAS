@@ -66,6 +66,15 @@ struct CaptureArgs {
 };
 
 static void capture_loop(CaptureArgs *a) {
+    // The capture thread must not be confined to the inference cores. Those
+    // are deliberately narrow (a few CPUs); sharing them would let the decoder
+    // starve the audio feed, which shows up as stutter and lag rather than as
+    // dropped audio. Lift any inherited restriction and widen to the whole
+    // machine.
+    DWORD_PTR process_mask = 0, system_mask = 0;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask))
+        SetThreadAffinityMask(GetCurrentThread(), process_mask);
+
     // Register with the Multimedia Class Scheduler Service. MMCSS gives the
     // audio thread a guaranteed slice and ducking priority over normal work,
     // which is enough to keep the capture path glitch-free without needing

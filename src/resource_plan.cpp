@@ -72,14 +72,30 @@ bool pin_current_thread(int first, int count) {
     return SetThreadAffinityMask(GetCurrentThread(), mask) != 0;
 }
 
-bool pin_process(int count) {
-    if (count <= 0) return true;
+bool pin_thread(HANDLE thread, int first, int count) {
+    if (count <= 0 || !thread) return true;
     DWORD_PTR mask = 0;
     const int n = logical_cpu_count();
-    for (int i = 0; i < count && i < n; ++i)
+    for (int i = first; i < first + count && i < n; ++i)
         mask |= ((DWORD_PTR)1 << i);
     if (!mask) return false;
-    return SetProcessAffinityMask(GetCurrentProcess(), mask) != 0;
+    return SetThreadAffinityMask(thread, mask) != 0;
+}
+
+// Clear the affinity restriction on the calling thread only.
+//
+// This deliberately does NOT use SetProcessAffinityMask. That call rewrites
+// the mask of every thread in the process, including the ONNX Runtime worker
+// threads each transcriber just created, which collapses the per-model split
+// back into one shared set and makes the two models contend. Linux has no
+// equivalent problem because sched_setaffinity affects only the calling
+// thread.
+bool unpin_current_thread() {
+    DWORD_PTR process_mask = 0, system_mask = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &process_mask,
+                                &system_mask))
+        return false;
+    return SetThreadAffinityMask(GetCurrentThread(), process_mask) != 0;
 }
 
 ResourcePlan plan_resources(int models,
