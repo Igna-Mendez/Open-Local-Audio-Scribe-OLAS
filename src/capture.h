@@ -5,8 +5,10 @@
  * loopback mode (ma_device_type_loopback) and delivers 16 kHz mono s16
  * frames (miniaudio resamples and downmixes) into a chunk-sized ring.
  *
- * The UI thread calls capture_read_chunk() to block until a full chunk is
- * available.
+ * The ring is loss-detecting: if the writer would overwrite unread frames,
+ * the write is skipped and an atomic overrun counter is incremented. The
+ * reader can query the counter via capture_get_stats(). Capture never
+ * blocks waiting for the reader.
  */
 #ifndef CAPTURE_H
 #define CAPTURE_H
@@ -17,37 +19,31 @@
 extern "C" {
     #endif
 
-    /* Initialize miniaudio and enumerate playback devices. Returns 1 on success. */
+    /* Opaque snapshot of capture-level counters. All values are cumulative
+     * since capture_init(). */
+    typedef struct {
+        uint64_t frames_received;
+        uint64_t ring_overruns;
+        uint64_t conversion_failures;
+        int      ring_frames_capacity;
+    } capture_stats_t;
+
     int  capture_init(void);
-
-    /* Set the chunk size (s16 mono frames) before the first capture_start. */
     void capture_set_chunk_samples(int n);
-
-    /* Start loopback capture on playback device index (-1 = default).
-     * Returns 1 on success. */
     int  capture_start(int device_index);
-
-    /* Stop capture and release the device. */
     void capture_stop(void);
-
-    /* Release everything (context, device, ring). */
     void capture_uninit(void);
 
-    /* Number of enumerated playback devices. */
     int  capture_device_count(void);
-
-    /* Name of device index ("" if out of range). */
     const char *capture_device_name(int index);
-
-    /* Is device index the system default? */
     int  capture_device_is_default(int index);
 
-    /* Block until g_chunk_samples s16 mono frames are available, then copy them
-     * into out and return 1. Returns 0 if capture was stopped while waiting. */
     int  capture_read_chunk(int16_t *out);
-
-    /* 1 if capture is currently running (between capture_start and capture_stop). */
+    int  capture_read_available(void);
     int  capture_is_started(void);
+
+    void capture_get_stats(capture_stats_t *out);
+    void capture_reset_stats(void);
 
     #ifdef __cplusplus
 }

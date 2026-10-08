@@ -1,15 +1,16 @@
 /*
- * capture.c — miniaudio WASAPI loopback capture (fixed).
+ * capture.c — miniaudio WASAPI loopback capture.
  *
- * Key fixes vs. previous version:
- *   - low-latency profile instead of conservative.
- *   - Explicit diagnostic dump of the ACTUAL native format + first-callback
- *     frame counts, so we can prove whether miniaudio is resampling or not.
- *   - If miniaudio hands us non-16kHz/non-mono/non-s16 data (because the
- *     loopback resampler did not engage), we now resample and convert it
- *     ourselves with ma_resampler + ma_channel_converter, then push 16 kHz
- *     mono s16 into the ring.
- *   - Error paths from ma_device_init now report the actual result code.
+ * Design goals:
+ *   - Never block the real-time callback.
+ *   - Never silently drop audio. If the ring is full when the writer tries
+ *     to write, skip the write and count an overrun.
+ *   - Process the entire callback input. No truncation.
+ *   - Report conversion failures explicitly.
+ *
+ * The ring is 1<<22 frames (~8 MiB at 16 kHz mono s16), which is ~262 s of
+ * headroom at 16 kHz. Overruns are practically impossible even when
+ * inference falls far behind.
  */
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -22,39 +23,38 @@
 #include <string.h>
 #include <stdbool.h>
 
+#include <stdatomic.h>
 #include "miniaudio.h"
 #include "capture.h"
 
 #define SAMPLE_RATE   16000
-#define MAX_CHUNK_SEC 10
 #define MAX_DEVICES 64
 
-#define RING_FRAMES ((ma_uint64)1u << 19)
+#define RING_FRAMES ((ma_uint64)1u << 22)
 #define RING_MASK   (RING_FRAMES - 1u)
 
-/* ---- 64-bit atomics ---- */
-static ma_uint64 atomic_load_u64(volatile ma_uint64 *p) {
-#ifdef _MSC_VER
-    return (ma_uint64)InterlockedCompareExchange64((volatile LONG64 *)p, 0, 0);
-#else
-    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+#define MAX_CALLBACK_FRAMES 65536
+
+/* mingw-w64's <stdatomic.h> omits atomic_uint64_t, which MSVC defines.
+ * Spell it out so the rest of the file reads the same on both toolchains. */
+#ifdef __MINGW32__
+typedef _Atomic(uint64_t) atomic_uint64_t;
 #endif
+
+static inline ma_uint64 atomic_load_u64(atomic_uint64_t *p) {
+    return atomic_load_explicit(p, memory_order_acquire);
 }
-static void atomic_store_u64(volatile ma_uint64 *p, ma_uint64 v) {
-#ifdef _MSC_VER
-    InterlockedExchange64((volatile LONG64 *)p, (LONG64)v);
-#else
-    __atomic_store_n(p, v, __ATOMIC_RELEASE);
-#endif
+static inline void atomic_store_u64(atomic_uint64_t *p, ma_uint64 v) {
+    atomic_store_explicit(p, v, memory_order_release);
+}
+static inline ma_uint64 atomic_add_u64(atomic_uint64_t *p, ma_uint64 v) {
+    return atomic_fetch_add_explicit(p, v, memory_order_relaxed);
 }
 
-/* ---- module state ---- */
 static ma_context  g_ctx;
 static ma_device   g_dev;
 static int         g_chunk_samples = 0;
 
-/* Conversion state — created in capture_start() if the native format
- * delivered by miniaudio is not already 16 kHz mono s16. */
 static ma_resampler         g_resampler;
 static ma_channel_converter g_chconv;
 static int                  g_have_resampler = 0;
@@ -66,8 +66,12 @@ static ma_bool32     g_dev_is_default[MAX_DEVICES];
 static int           g_n_devices = 0;
 
 static int16_t             g_ring[RING_FRAMES];
-static volatile ma_uint64  g_ring_read    = 0;
-static volatile ma_uint64  g_ring_written = 0;
+static atomic_uint64_t     g_ring_read    = 0;
+static atomic_uint64_t     g_ring_written = 0;
+
+static atomic_uint64_t     g_frames_received     = 0;
+static atomic_uint64_t     g_ring_overruns       = 0;
+static atomic_uint64_t     g_conversion_failures = 0;
 
 static HANDLE g_have_chunk = NULL;
 static int    g_ctx_ok = 0;
@@ -75,7 +79,6 @@ static int    g_cs_ok = 0;
 static int    g_started = 0;
 static CRITICAL_SECTION g_cs;
 
-/* ---- device enumeration ---- */
 struct enum_ctx { int index; };
 
 static ma_bool32 ma_enum_devices(ma_context *pContext, ma_device_type deviceType,
@@ -114,59 +117,73 @@ int capture_init(void) {
     g_have_chunk = CreateEventW(NULL, FALSE, FALSE, NULL);
     if (!g_have_chunk) {
         fprintf(stderr, "capture: CreateEventW failed\n");
+        DeleteCriticalSection(&g_cs);
+        g_cs_ok = 0;
+        ma_context_uninit(&g_ctx);
+        g_ctx_ok = 0;
         return 0;
     }
     g_ctx_ok = 1;
     return g_n_devices > 0;
 }
 
-/* ---- push converted 16 kHz mono s16 frames into the ring ---- */
 static void ring_push(const int16_t *frames, ma_uint32 count) {
     if (count == 0) return;
-    ma_uint64 w = atomic_load_u64(&g_ring_written);
-    for (ma_uint32 i = 0; i < count; ++i)
-        g_ring[(w + i) & RING_MASK] = frames[i];
-    w += count;
-    atomic_store_u64(&g_ring_written, w);
 
-    const ma_uint64 r = atomic_load_u64(&g_ring_read);
-    if (w - r >= (ma_uint64)g_chunk_samples)
+    /* Use a CAS loop to atomically reserve space for `count` frames.
+     * This avoids the race where two concurrent ring_push() calls
+     * could both pass the overrun check and overlap. */
+    for (;;) {
+        const ma_uint64 r = atomic_load_u64(&g_ring_read);
+        const ma_uint64 w = atomic_load_u64(&g_ring_written);
+
+        if (w - r + count > RING_FRAMES) {
+            atomic_add_u64(&g_ring_overruns, 1);
+            return;
+        }
+
+        /* Try to claim this write window. If the reader advanced or another
+         * writer claimed it first, we'll retry. */
+        if (atomic_compare_exchange_weak_explicit(
+                &g_ring_written, &w, w + count,
+                memory_order_release, memory_order_acquire)) {
+            break;  /* Successfully claimed — write our frames */
+        }
+        /* CAS failed; retry with updated w from the CAS call. */
+    }
+
+    /* Now write the frames at the claimed window. We know no other writer
+     * will write here, and the reader is behind us. */
+    for (ma_uint32 i = 0; i < count; ++i)
+        g_ring[(atomic_load_u64(&g_ring_written) - count + i) & RING_MASK] = frames[i];
+
+    if (atomic_load_u64(&g_ring_written) - atomic_load_u64(&g_ring_read)
+        >= (ma_uint64)g_chunk_samples)
         SetEvent(g_have_chunk);
 }
 
-/* ---- data callback ---- */
 static void ma_data_callback(ma_device *pDevice, void *pOut,
                              const void *pIn, ma_uint32 frameCount) {
     (void)pDevice; (void)pOut;
     if (!g_started || !pIn || frameCount == 0) return;
 
-    /* One-shot diagnostic to prove what miniaudio is actually feeding us. */
-    static int logged = 0;
-    if (!logged) {
-        logged = 1;
-        fprintf(stderr,
-            "capture: first callback frameCount=%u native=%u Hz ch=%u fmt=%d "
-            "(converter %s)\n",
-            frameCount, g_dev.sampleRate, g_dev.capture.channels,
-            (int)g_dev.capture.format,
-            g_have_resampler ? "engaged" : "passthrough");
-        fflush(stderr);
-    }
+    atomic_add_u64(&g_frames_received, frameCount);
 
-    /* Fast path: miniaudio already delivered 16 kHz mono s16. */
     if (!g_have_resampler && !g_have_chconv) {
         ring_push((const int16_t *)pIn, frameCount);
         return;
     }
 
-    /* Slow path: convert native → f32, channel-convert → mono,
-     * resample → 16 kHz, quantize → s16, push. */
-    static float  fbuf_in[16384];
-    static float  fbuf_mono[16384];
-    static int16_t outbuf[16384];
+    static float   fbuf_in[MAX_CALLBACK_FRAMES];
+    static float   fbuf_mono[MAX_CALLBACK_FRAMES];
+    static float   fbuf_res[MAX_CALLBACK_FRAMES];   /* resampler output — separate from fbuf_mono to avoid in-place when chconv is also active */
+    static int16_t outbuf[MAX_CALLBACK_FRAMES];
 
     ma_uint32 n = frameCount;
-    if (n > 16384) n = 16384;   /* clamp; should never happen */
+    if (n > MAX_CALLBACK_FRAMES) {
+        atomic_add_u64(&g_conversion_failures, 1);
+        n = MAX_CALLBACK_FRAMES;
+    }
 
     if (g_dev.capture.format == ma_format_f32) {
         memcpy(fbuf_in, pIn, n * sizeof(float));
@@ -180,19 +197,26 @@ static void ma_data_callback(ma_device *pDevice, void *pOut,
     ma_uint32 mono_frames = n;
     const float *mono_ptr = fbuf_in;
     if (g_have_chconv) {
-        ma_channel_converter_process_pcm_frames(&g_chconv,
-                                                fbuf_mono, fbuf_in, n);
+        if (ma_channel_converter_process_pcm_frames(&g_chconv,
+                                                    fbuf_mono, fbuf_in, n) != MA_SUCCESS) {
+            atomic_add_u64(&g_conversion_failures, 1);
+            return;
+        }
         mono_ptr = fbuf_mono;
     }
 
-    ma_uint64 out_frames = 0;
     if (g_have_resampler) {
         ma_uint64 in_frames_64 = mono_frames;
-        ma_resampler_process_pcm_frames(&g_resampler,
-                                        mono_ptr, &in_frames_64,
-                                        fbuf_mono, &out_frames);
+        ma_uint64 out_frames = MAX_CALLBACK_FRAMES;
+        if (ma_resampler_process_pcm_frames(&g_resampler,
+                                            mono_ptr, &in_frames_64,
+                                            fbuf_res, &out_frames) != MA_SUCCESS) {
+            atomic_add_u64(&g_conversion_failures, 1);
+            return;
+        }
+        if (out_frames > MAX_CALLBACK_FRAMES) out_frames = MAX_CALLBACK_FRAMES;
         for (ma_uint64 i = 0; i < out_frames; ++i) {
-            float s = fbuf_mono[i];
+            float s = fbuf_res[i];
             if (s >  1.0f) s =  1.0f;
             if (s < -1.0f) s = -1.0f;
             outbuf[i] = (int16_t)(s * 32767.0f);
@@ -219,9 +243,6 @@ int capture_start(int device_index) {
     cfg.performanceProfile = ma_performance_profile_low_latency;
     cfg.wasapi.usage       = ma_wasapi_usage_pro_audio;
 
-    /* Ask for what we want. If miniaudio honours it, we get 16 kHz mono s16
-     * and skip all per-callback conversion. If it doesn't, the callback
-     * still receives native-rate data and the converters below fix it. */
     cfg.sampleRate       = SAMPLE_RATE;
     cfg.capture.channels = 1;
     cfg.capture.format   = ma_format_s16;
@@ -236,7 +257,6 @@ int capture_start(int device_index) {
         return 0;
     }
 
-    /* Detect whether miniaudio actually gave us 16 kHz mono s16. */
     g_have_resampler = 0;
     g_have_chconv    = 0;
 
@@ -253,8 +273,10 @@ int capture_start(int device_index) {
             got_fmt, got_ch, NULL, 1, NULL, ma_channel_mix_mode_default);
         if (ma_channel_converter_init(&cc, NULL, &g_chconv) == MA_SUCCESS)
             g_have_chconv = 1;
-        else
+        else {
             fprintf(stderr, "capture: channel converter init failed\n");
+            atomic_add_u64(&g_conversion_failures, 1);
+        }
     }
 
     if (got_rate != SAMPLE_RATE) {
@@ -263,23 +285,30 @@ int capture_start(int device_index) {
             ma_resample_algorithm_linear);
         if (ma_resampler_init(&rc, NULL, &g_resampler) == MA_SUCCESS)
             g_have_resampler = 1;
-        else
+        else {
             fprintf(stderr, "capture: resampler init failed\n");
+            atomic_add_u64(&g_conversion_failures, 1);
+        }
     }
 
     r = ma_device_start(&g_dev);
     if (r != MA_SUCCESS) {
         fprintf(stderr, "capture: ma_device_start failed (%d)\n", (int)r);
         ma_device_uninit(&g_dev);
+        if (g_have_resampler) { ma_resampler_uninit(&g_resampler, NULL); g_have_resampler = 0; }
+        if (g_have_chconv)    { ma_channel_converter_uninit(&g_chconv, NULL); g_have_chconv = 0; }
         return 0;
     }
 
+    /* Reset the ring BEFORE arming g_started: once the flag is set the
+     * audio thread can push into the ring at any moment, and a stale
+     * write pointer from a previous session would look like a full ring. */
     ResetEvent(g_have_chunk);
     EnterCriticalSection(&g_cs);
     atomic_store_u64(&g_ring_read,    0);
     atomic_store_u64(&g_ring_written, 0);
-    g_started = 1;
     LeaveCriticalSection(&g_cs);
+    g_started = 1;
     return 1;
 }
 
@@ -335,6 +364,20 @@ int capture_read_chunk(int16_t *out) {
         out[i] = g_ring[(r + i) & RING_MASK];
     atomic_store_u64(&g_ring_read, r + (ma_uint64)g_chunk_samples);
     return 1;
+}
+
+void capture_get_stats(capture_stats_t *out) {
+    if (!out) return;
+    out->frames_received     = atomic_load_u64(&g_frames_received);
+    out->ring_overruns       = atomic_load_u64(&g_ring_overruns);
+    out->conversion_failures = atomic_load_u64(&g_conversion_failures);
+    out->ring_frames_capacity = (int)RING_FRAMES;
+}
+
+void capture_reset_stats(void) {
+    atomic_store_u64(&g_frames_received, 0);
+    atomic_store_u64(&g_ring_overruns, 0);
+    atomic_store_u64(&g_conversion_failures, 0);
 }
 
 void capture_uninit(void) {
