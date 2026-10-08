@@ -35,19 +35,23 @@
 
 #define MAX_CALLBACK_FRAMES 65536
 
-/* mingw-w64's <stdatomic.h> omits atomic_uint64_t, which MSVC defines.
- * Spell it out so the rest of the file reads the same on both toolchains. */
-#ifdef __MINGW32__
-typedef _Atomic(uint64_t) atomic_uint64_t;
-#endif
+/* Neither toolchain spells this type the same way -- mingw-w64's <stdatomic.h>
+ * has no atomic_uint64_t, and MSVC's does not either unless the name is one of
+ * its own spellings. Rather than depend on it, name the type here and use it
+ * everywhere below. _Atomic(uint64_t) is the standard spelling and both
+ * compilers accept it.
+ *
+ * MSVC also needs /experimental:c11atomics (set in CMakeLists.txt) before it
+ * will parse _Atomic at all. */
+typedef _Atomic(uint64_t) olas_atomic_u64;
 
-static inline ma_uint64 atomic_load_u64(atomic_uint64_t *p) {
+static inline ma_uint64 atomic_load_u64(olas_atomic_u64 *p) {
     return atomic_load_explicit(p, memory_order_acquire);
 }
-static inline void atomic_store_u64(atomic_uint64_t *p, ma_uint64 v) {
+static inline void atomic_store_u64(olas_atomic_u64 *p, ma_uint64 v) {
     atomic_store_explicit(p, v, memory_order_release);
 }
-static inline ma_uint64 atomic_add_u64(atomic_uint64_t *p, ma_uint64 v) {
+static inline ma_uint64 atomic_add_u64(olas_atomic_u64 *p, ma_uint64 v) {
     return atomic_fetch_add_explicit(p, v, memory_order_relaxed);
 }
 
@@ -66,12 +70,12 @@ static ma_bool32     g_dev_is_default[MAX_DEVICES];
 static int           g_n_devices = 0;
 
 static int16_t             g_ring[RING_FRAMES];
-static atomic_uint64_t     g_ring_read    = 0;
-static atomic_uint64_t     g_ring_written = 0;
+static olas_atomic_u64     g_ring_read    = 0;
+static olas_atomic_u64     g_ring_written = 0;
 
-static atomic_uint64_t     g_frames_received     = 0;
-static atomic_uint64_t     g_ring_overruns       = 0;
-static atomic_uint64_t     g_conversion_failures = 0;
+static olas_atomic_u64     g_frames_received     = 0;
+static olas_atomic_u64     g_ring_overruns       = 0;
+static olas_atomic_u64     g_conversion_failures = 0;
 
 static HANDLE g_have_chunk = NULL;
 static int    g_ctx_ok = 0;
@@ -135,7 +139,9 @@ static void ring_push(const int16_t *frames, ma_uint32 count) {
      * could both pass the overrun check and overlap. */
     for (;;) {
         const ma_uint64 r = atomic_load_u64(&g_ring_read);
-        const ma_uint64 w = atomic_load_u64(&g_ring_written);
+        /* Not const: compare_exchange writes the observed value back into it
+         * on failure. GCC accepts a const expected-value; MSVC rejects it. */
+        ma_uint64 w = atomic_load_u64(&g_ring_written);
 
         if (w - r + count > RING_FRAMES) {
             atomic_add_u64(&g_ring_overruns, 1);
