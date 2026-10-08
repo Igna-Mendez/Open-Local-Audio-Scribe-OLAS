@@ -176,13 +176,31 @@ powershell -ExecutionPolicy Bypass -File setup.ps1
 
 mkdir build
 cd build
-cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DONNXRUNTIME_MODE=bundled ..
+cmake -G Ninja -DCMAKE_BUILD_TYPE=Release ..
 cmake --build . --config Release -j
 ```
 
 `setup.ps1` checks the toolchain, fetches all three models into `models\`, and
-prints the exact configure command. The first configure takes 5–15 minutes: it
-fetches the Moonshine sources and builds ONNX Runtime from them.
+prints the exact configure command.
+
+The first configure downloads the **Moonshine SDK** — a prebuilt release
+archive (~26 MB) containing the headers, the import libraries and
+`onnxruntime.dll`. Nothing is built from source, so configure takes a minute or
+two rather than the 5–15 minutes a source build of ONNX Runtime would need.
+
+It follows Moonshine's **latest** release, and stays current: the configure
+records which release it fetched, checks for a newer one each time, and
+re-downloads when there is one. Reconfigure to pick up a new release.
+
+| option | effect |
+| --- | --- |
+| `-DMOONSHINE_VERSION=v0.1.5` | pin a specific release instead of latest |
+| `-DMOONSHINE_REFRESH=1` | force a re-download now |
+| `-DMOONSHINE_SDK_DIR=<dir>` | use an SDK already on disk |
+
+Deleting `build\moonshine-sdk\` also forces a fresh download. Offline, or if
+the release check fails, the cached SDK is kept rather than failing the
+configure.
 
 To produce a release zip, including the models:
 

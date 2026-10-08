@@ -17,80 +17,179 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
 endif()
 
 # ---------------------------------------------------------------------------
-# Options
-# ---------------------------------------------------------------------------
-set(ONNXRUNTIME_MODE "bundled" CACHE STRING "Where to get ONNX Runtime from")
-set(ONNXRUNTIME_ROOT "C:/onnxruntime" CACHE PATH "Path to prebuilt ONNX Runtime")
-
-# ---------------------------------------------------------------------------
 # Moonshine
 # ---------------------------------------------------------------------------
-include(FetchContent)
+#
+# Moonshine ships a prebuilt SDK per platform on its GitHub Releases, and that
+# is what this project consumes. The Linux build does the same.
+#
+# Why not build Moonshine from source via FetchContent? Because that route no
+# longer works against current Moonshine. Upstream restructured the repository
+# after v0.0.65: the public headers (moonshine-cpp.h / moonshine-c-api.h) moved
+# out of the source tree entirely, and the v0.0.67-v0.0.69 tags reference
+# cpp-annote/src/community1_ort_embedded.cpp, a file those tags do not contain.
+# Building from a tag therefore fails at generate time, and the newer tags have
+# no headers to include. The released SDK has both, and it tracks latest.
+#
+# The tarball is ~26 MB and contains:
+#   include/moonshine-cpp.h, moonshine-c-api.h
+#   lib/moonshine.lib, moonshine-utils.lib, bin-tokenizer.lib, ort-utils.lib,
+#       onnxruntime.lib, onnxruntime.dll
+#
+# Override the whole thing with -DMOONSHINE_SDK_DIR=<path> to use an SDK you
+# already have, or -DMOONSHINE_SDK_URL=<url> to fetch from elsewhere.
 
-# Pinned to a specific Moonshine release so builds are reproducible.
-# Update deliberately after testing compatibility.
-set(MOONSHINE_GIT_TAG "v0.0.69" CACHE STRING "Moonshine tag or commit to build against")
+set(MOONSHINE_VERSION "latest" CACHE STRING
+    "Moonshine release tag, or 'latest' to follow the newest release")
 
-FetchContent_Declare(
-    moonshine
-    GIT_REPOSITORY https://github.com/moonshine-ai/moonshine.git
-    GIT_TAG ${MOONSHINE_GIT_TAG}
-    GIT_SHALLOW TRUE
-    SOURCE_SUBDIR core
-)
-
-set(MOONSHINE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(MOONSHINE_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
-
-FetchContent_MakeAvailable(moonshine)
-# Moonshine's public headers (moonshine-cpp.h) live under its source's core/ dir.
-# The target doesn't export an INTERFACE include dir for them, so wire it up.
-FetchContent_GetProperties(moonshine)
-
-if(NOT moonshine_POPULATED)
-    FetchContent_Populate(moonshine)
+if(MOONSHINE_VERSION STREQUAL "latest")
+    set(MOONSHINE_SDK_URL
+        "https://github.com/moonshine-ai/moonshine/releases/latest/download/moonshine-voice-windows-x86_64.tar.gz"
+        CACHE STRING "Moonshine Windows SDK tarball URL")
+else()
+    set(MOONSHINE_SDK_URL
+        "https://github.com/moonshine-ai/moonshine/releases/download/${MOONSHINE_VERSION}/moonshine-voice-windows-x86_64.tar.gz"
+        CACHE STRING "Moonshine Windows SDK tarball URL")
 endif()
 
-set(MOONSHINE_INCLUDE_DIR "${moonshine_SOURCE_DIR}/core")
+set(MOONSHINE_SDK_DIR "${CMAKE_BINARY_DIR}/moonshine-sdk" CACHE PATH
+    "Directory holding the extracted Moonshine SDK (include/ and lib/)")
+
+# A cached SDK is reused unless something says otherwise, so a build tree made
+# months ago would keep that release's headers and libraries forever. Record
+# which release was fetched and re-fetch when Moonshine publishes a new one.
+# Re-run with -DMOONSHINE_REFRESH=1 to force it, or delete moonshine-sdk/.
+set(MOONSHINE_REFRESH OFF CACHE BOOL "Re-download the Moonshine SDK")
+set(_sdk_ver_file "${MOONSHINE_SDK_DIR}/.sdk-version")
+
+set(_sdk_resolved_version "")
+set(_need_sdk FALSE)
+if(NOT EXISTS "${MOONSHINE_SDK_DIR}/include/moonshine-cpp.h")
+    set(_need_sdk TRUE)
+elseif(MOONSHINE_REFRESH)
+    message(STATUS "OLAS: SDK refresh requested (-DMOONSHINE_REFRESH=1)")
+    set(_need_sdk TRUE)
+elseif(MOONSHINE_VERSION STREQUAL "latest")
+    # Ask GitHub only when we already have an SDK, to avoid a needless call on
+    # a fresh tree. Offline or rate-limited, keep what we have.
+    file(DOWNLOAD
+        "https://api.github.com/repos/moonshine-ai/moonshine/releases/latest"
+        "${CMAKE_BINARY_DIR}/_moonshine_latest.json"
+        STATUS _rel_status TLS_VERIFY ON)
+    list(GET _rel_status 0 _rel_code)
+    if(_rel_code EQUAL 0)
+        file(READ "${CMAKE_BINARY_DIR}/_moonshine_latest.json" _rel_json)
+        string(REGEX MATCH "\"tag_name\"[ \t]*:[ \t]*\"([^\"]*)\"" _m "${_rel_json}")
+        set(_remote "${CMAKE_MATCH_1}")
+        set(_local "")
+        if(EXISTS "${_sdk_ver_file}")
+            file(READ "${_sdk_ver_file}" _local)
+            string(STRIP "${_local}" _local)
+        endif()
+        if(NOT _remote STREQUAL "" AND NOT _remote STREQUAL _local)
+            message(STATUS "OLAS: new Moonshine release "
+                           "${_local} -> ${_remote}")
+            set(_need_sdk TRUE)
+        endif()
+        set(_sdk_resolved_version "${_remote}")
+    endif()
+    file(REMOVE "${CMAKE_BINARY_DIR}/_moonshine_latest.json")
+endif()
+
+if(_need_sdk)
+    message(STATUS "OLAS: fetching the Moonshine SDK")
+    message(STATUS "      ${MOONSHINE_SDK_URL}")
+
+    set(_sdk_tar "${CMAKE_BINARY_DIR}/moonshine-sdk.tar.gz")
+    file(DOWNLOAD "${MOONSHINE_SDK_URL}" "${_sdk_tar}"
+         STATUS _dl_status
+         SHOW_PROGRESS)
+    list(GET _dl_status 0 _dl_code)
+    if(NOT _dl_code EQUAL 0)
+        list(GET _dl_status 1 _dl_msg)
+        message(FATAL_ERROR
+            "Could not download the Moonshine SDK.\n"
+            "  URL:   ${MOONSHINE_SDK_URL}\n"
+            "  Error: ${_dl_msg}\n"
+            "Fetch it manually and pass -DMOONSHINE_SDK_DIR=<extracted dir>.")
+    endif()
+
+    file(MAKE_DIRECTORY "${MOONSHINE_SDK_DIR}")
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -E tar xzf "${_sdk_tar}"
+        WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+        RESULT_VARIABLE _extract_rc)
+    if(NOT _extract_rc EQUAL 0)
+        message(FATAL_ERROR "Could not extract ${_sdk_tar}")
+    endif()
+
+    # The archive has a single top-level directory; flatten it so that
+    # include/ and lib/ sit directly under MOONSHINE_SDK_DIR.
+    file(GLOB _top "${CMAKE_BINARY_DIR}/moonshine-voice-windows-*")
+    if(_top)
+        list(GET _top 0 _topdir)
+        file(COPY "${_topdir}/" DESTINATION "${MOONSHINE_SDK_DIR}")
+        file(REMOVE_RECURSE "${_topdir}")
+    endif()
+    file(REMOVE "${_sdk_tar}")
+
+    # Remember which release this came from, so a later configure can tell
+    # whether it is stale.
+    #
+    # Pinned to a tag: we know it. "latest" on a fresh tree: the API lookup at
+    # the top is skipped (there is nothing to compare against), so look it up
+    # now purely to label the download. If that fails, record "unknown" and
+    # the next configure will treat the SDK as possibly stale and refresh --
+    # which is the safe direction.
+    if(NOT MOONSHINE_VERSION STREQUAL "latest")
+        set(_sdk_resolved_version "${MOONSHINE_VERSION}")
+    elseif(_sdk_resolved_version STREQUAL "")
+        file(DOWNLOAD
+            "https://api.github.com/repos/moonshine-ai/moonshine/releases/latest"
+            "${CMAKE_BINARY_DIR}/_moonshine_latest.json"
+            STATUS _rel2_status TLS_VERIFY ON)
+        list(GET _rel2_status 0 _rel2_code)
+        if(_rel2_code EQUAL 0)
+            file(READ "${CMAKE_BINARY_DIR}/_moonshine_latest.json" _rel2_json)
+            string(REGEX MATCH "\"tag_name\"[ \t]*:[ \t]*\"([^\"]*)\""
+                   _m2 "${_rel2_json}")
+            set(_sdk_resolved_version "${CMAKE_MATCH_1}")
+        endif()
+        file(REMOVE "${CMAKE_BINARY_DIR}/_moonshine_latest.json")
+    endif()
+    if(_sdk_resolved_version STREQUAL "")
+        set(_sdk_resolved_version "unknown")
+    endif()
+    file(WRITE "${_sdk_ver_file}" "${_sdk_resolved_version}\n")
+    message(STATUS "OLAS: Moonshine SDK ${_sdk_resolved_version}")
+endif()
+
+set(MOONSHINE_INCLUDE_DIR "${MOONSHINE_SDK_DIR}/include")
+set(MOONSHINE_LIB_DIR     "${MOONSHINE_SDK_DIR}/lib")
+
 if(NOT EXISTS "${MOONSHINE_INCLUDE_DIR}/moonshine-cpp.h")
     message(FATAL_ERROR
-        "moonshine-cpp.h not found at ${MOONSHINE_INCLUDE_DIR}. "
-        "Check the Moonshine source layout.")
+        "moonshine-cpp.h not found under ${MOONSHINE_INCLUDE_DIR}.\n"
+        "The SDK layout may have changed, or MOONSHINE_SDK_DIR points at the "
+        "wrong place. Expected include/moonshine-cpp.h next to lib/moonshine.lib.")
+endif()
+if(NOT EXISTS "${MOONSHINE_LIB_DIR}/moonshine.lib")
+    message(FATAL_ERROR "moonshine.lib not found under ${MOONSHINE_LIB_DIR}")
 endif()
 
-message(STATUS "OLAS: Moonshine headers at ${MOONSHINE_INCLUDE_DIR}")
+# Imported target for the SDK, so the rest of this file and the linker only
+# need one name.
+add_library(moonshine_sdk SHARED IMPORTED GLOBAL)
+set_target_properties(moonshine_sdk PROPERTIES
+    IMPORTED_IMPLIB        "${MOONSHINE_LIB_DIR}/moonshine.lib"
+    IMPORTED_LOCATION      "${MOONSHINE_LIB_DIR}/moonshine.dll"
+    INTERFACE_INCLUDE_DIRECTORIES "${MOONSHINE_INCLUDE_DIR}")
 
-set(MOONSHINE_TARGET moonshine)
+message(STATUS "OLAS: Moonshine SDK at ${MOONSHINE_SDK_DIR}")
 
-if(NOT TARGET ${MOONSHINE_TARGET})
-    message(FATAL_ERROR
-        "Could not find the 'moonshine' CMake target. "
-        "Check the FetchContent output above. The library target may have been renamed.")
-endif()
-
-message(STATUS "OLAS: using Moonshine target '${MOONSHINE_TARGET}'")
-
-# ---------------------------------------------------------------------------
-# ONNX Runtime
-# ---------------------------------------------------------------------------
-if(ONNXRUNTIME_MODE STREQUAL "bundled")
-    message(STATUS "OLAS: ONNX Runtime provided by Moonshine (bundled)")
-
-elseif(ONNXRUNTIME_MODE STREQUAL "prebuilt")
-    if(NOT EXISTS "${ONNXRUNTIME_ROOT}/include/onnxruntime_cxx_api.h")
-        message(FATAL_ERROR
-            "ONNXRUNTIME_MODE=prebuilt but ${ONNXRUNTIME_ROOT}/include/"
-            "onnxruntime_cxx_api.h does not exist.")
-    endif()
-    message(STATUS "OLAS: using prebuilt ONNX Runtime at ${ONNXRUNTIME_ROOT}")
-
-elseif(ONNXRUNTIME_MODE STREQUAL "vcpkg")
-    find_package(onnxruntime CONFIG REQUIRED)
-    message(STATUS "OLAS: using vcpkg ONNX Runtime")
-
-else()
-    message(FATAL_ERROR "Unknown ONNXRUNTIME_MODE='${ONNXRUNTIME_MODE}'")
-endif()
+# The SDK bundles ONNX Runtime; there is no separate mode to choose.
+set(ORT_DLL_SOURCE "${MOONSHINE_LIB_DIR}/onnxruntime.dll")
+message(STATUS "OLAS: ONNX Runtime provided by the Moonshine SDK (bundled)")
 
 # ---------------------------------------------------------------------------
 # Build provenance + update-check metadata
@@ -147,10 +246,6 @@ target_include_directories(olas_win PRIVATE
     "${MOONSHINE_INCLUDE_DIR}"
 )
 
-if(ONNXRUNTIME_MODE STREQUAL "prebuilt")
-    target_include_directories(olas_win PRIVATE "${ONNXRUNTIME_ROOT}/include")
-endif()
-
 target_compile_definitions(olas_win PRIVATE
     UNICODE
     _UNICODE
@@ -178,17 +273,8 @@ target_link_libraries(olas_win PRIVATE
     winhttp
 )
 
-# Link Moonshine (pulls in ONNX Runtime in bundled mode).
-target_link_libraries(olas_win PRIVATE ${MOONSHINE_TARGET})
-
-if(ONNXRUNTIME_MODE STREQUAL "prebuilt")
-    target_link_directories(olas_win PRIVATE "${ONNXRUNTIME_ROOT}/lib")
-    target_link_libraries(olas_win PRIVATE onnxruntime)
-endif()
-
-if(ONNXRUNTIME_MODE STREQUAL "vcpkg")
-    target_link_libraries(olas_win PRIVATE onnxruntime::onnxruntime)
-endif()
+# The Moonshine SDK bundles ONNX Runtime; linking the SDK is enough.
+target_link_libraries(olas_win PRIVATE moonshine_sdk)
 
 # --- Entry point / subsystem -------------------------------------------------
 # `add_executable(... WIN32 ...)` sets /SUBSYSTEM:WINDOWS, whose CRT entry
@@ -220,13 +306,8 @@ if(MINGW)
 endif()
 
 # ---------------------------------------------------------------------------
-# Locate onnxruntime.dll after Moonshine is built so it can be copied to the
-# exe dir. Same generator expression the dist target uses below.
-# ---------------------------------------------------------------------------
-set(ORT_DLL_SOURCE "$<TARGET_FILE_DIR:moonshine>/onnxruntime.dll")
-
-# ---------------------------------------------------------------------------
-# Post-build: make the build tree runnable in place
+# Post-build: make the build tree runnable in place by putting the runtime
+# DLL next to the exe. The SDK ships it under lib/.
 # ---------------------------------------------------------------------------
 if(WIN32)
     add_custom_command(TARGET olas_win POST_BUILD
@@ -236,28 +317,6 @@ if(WIN32)
         COMMENT "Copying onnxruntime.dll next to olas_win.exe"
         VERBATIM
     )
-endif()
-
-if(ONNXRUNTIME_MODE STREQUAL "prebuilt")
-    add_custom_command(TARGET olas_win POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${ONNXRUNTIME_ROOT}/lib/onnxruntime.dll"
-            "$<TARGET_FILE_DIR:olas_win>"
-        COMMENT "Copying prebuilt onnxruntime.dll next to olas_win.exe"
-        VERBATIM
-    )
-endif()
-
-if(ONNXRUNTIME_MODE STREQUAL "vcpkg" AND DEFINED VCPKG_TARGET_TRIPLET)
-    if(VCPKG_TARGET_TRIPLET MATCHES "^x64-windows$" OR VCPKG_TARGET_TRIPLET MATCHES "^x64-windows-static-md$")
-        add_custom_command(TARGET olas_win POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_directory
-                "${CMAKE_CURRENT_SOURCE_DIR}/../vcpkg/installed/${VCPKG_TARGET_TRIPLET}/bin"
-                "$<TARGET_FILE_DIR:olas_win>"
-            COMMENT "Copying vcpkg runtime DLLs next to olas_win.exe"
-            VERBATIM
-        )
-    endif()
 endif()
 
 # ---------------------------------------------------------------------------

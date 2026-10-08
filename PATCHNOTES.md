@@ -130,6 +130,60 @@ Three separate bugs:
 
 ### Build fixes
 
+**Moonshine is now consumed as a prebuilt SDK, not built from source.**
+
+CMake used to `FetchContent` the Moonshine git repository and build it, pinned
+to a tag. That broke in two separate ways:
+
+- The `v0.0.67`–`v0.0.69` tags reference
+  `cpp-annote/src/community1_ort_embedded.cpp`, a file those tags do not
+  contain, so CMake fails at generate time with *"Cannot find source file"* and
+  *"No SOURCES given to target: moonshine"*.
+- From `v0.1.0` the repository was restructured and the public headers
+  (`moonshine-cpp.h`, `moonshine-c-api.h`) left the source tree entirely. No
+  `v0.1.x` tag has them anywhere.
+
+So there is no usable tag: the old ones cannot configure, the new ones have no
+headers. A survey of the tags:
+
+| tag | `core/moonshine-cpp.h` | broken `community1` ref |
+| --- | ---------------------- | ----------------------- |
+| v0.0.60 | no | no |
+| v0.0.65 | **yes** | no |
+| v0.0.67 | no | yes |
+| v0.0.68 | no | yes |
+| v0.0.69 | no | yes |
+| v0.1.x | no | no |
+
+The build now downloads the released Windows SDK instead:
+
+```
+https://github.com/moonshine-ai/moonshine/releases/latest/download/\
+    moonshine-voice-windows-x86_64.tar.gz
+```
+
+That archive carries `include/` (both headers), `lib/moonshine.lib` and the
+other import libraries, and `lib/onnxruntime.dll`. Because the URL ends in
+`/releases/latest/` it follows the newest Moonshine release — no pinning, and
+no source-tree archaeology. The Linux build has always worked this way.
+
+Side benefits: configure dropped from 5–15 minutes (building ONNX Runtime from
+source) to under 2 minutes, and `ONNXRUNTIME_MODE` is gone since there is
+nothing to choose.
+
+Override with `-DMOONSHINE_VERSION=<tag>` to pin, or `-DMOONSHINE_SDK_DIR=<dir>`
+to use an SDK already on disk.
+
+The SDK is kept current: the fetched release is recorded in
+`moonshine-sdk/.sdk-version`, each configure asks GitHub for the latest, and a
+different tag triggers a re-download. `-DMOONSHINE_REFRESH=1` forces it, and
+deleting `moonshine-sdk/` does the same. Offline or rate-limited, the cached
+copy is kept rather than failing the configure.
+
+As of this writing the current release is **v0.1.5** (2026-08-24).
+
+**Other build fixes**
+
 - `capture.c` used `atomic_uint64_t`, which MSVC defines but mingw-w64's
   `<stdatomic.h>` does not. CMake supports both toolchains, so the type is now
   named explicitly under `__MINGW32__`. Verified: the whole tree cross-compiles
@@ -141,6 +195,8 @@ Three separate bugs:
   PS 5.1 has no ternary operator, so it would have thrown. Removed.
 - `tools/download-models.bat` deleted: it fetched the obsolete non-streaming
   models.
+- PowerShell scripts are blocked by the default execution policy; run them as
+  `powershell -ExecutionPolicy Bypass -File <script>.ps1`.
 
 ### Benchmarking pitfalls hit along the way
 
