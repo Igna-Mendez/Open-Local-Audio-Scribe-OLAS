@@ -36,6 +36,7 @@ void win32_ui_shutdown();
 
 // Thread-safe: post a "new version available" prompt to the UI thread.
 // Does nothing if the main window isn't up yet or `url` is empty.
-void win32_ui_show_update_prompt(const char* local_sha,
-                                 const char* remote_sha,
-                                 const char* url);
+// `tag` is the release version, `name` its title (may be empty), `local`
+// this build's label. All three are UTF-8; the UI converts them.
+void win32_ui_show_update_prompt(const char* tag, const char* name,
+                                 const char* local, const char* url);

@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <shellapi.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -14,9 +15,10 @@
 #include <memory>
 #include <string>
 #include <thread>
-#include "update_check.h"
 #include <vector>
 #include <avrt.h>
+#include "update_check.h"
+#include "model_choice.h"
 
 #include "moonshine_engine.h"
 #include "transcript_sink.h"
@@ -34,9 +36,14 @@ static std::vector<LanguageConfig> g_configs;
 static double g_silence_rms        = DEF_SILENCE_RMS;
 static int    g_capture_chunk_ms   = DEFAULT_CAPTURE_CHUNK_MS;
 static bool   g_no_update_check    = false;
+static bool   g_show_stats         = false;
 
 static FILE *g_notes   = nullptr;
 static std::atomic<bool> g_running{true};
+
+// Chosen on first run, or read from the saved file. Unset means the user has
+// not been asked yet and the CLI did not specify an arch.
+static EnglishModel g_english_choice = EnglishModel::Unset;
 
 // ---------------- Win32 transcript sink ----------------
 
@@ -76,7 +83,7 @@ static void capture_loop(CaptureArgs *a) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
-        a->engine->feed(pcm);
+        a->engine->feed(std::make_shared<const std::vector<int16_t>>(pcm));
     }
 
     if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
@@ -102,8 +109,6 @@ static std::vector<std::string> argv_to_utf8(int &argc_out) {
     return out;
 }
 
-static const char *DEF_MONITOR_SRC = "auto";
-
 static std::string default_model_dir(int arch, const std::string &lang) {
     switch (arch) {
         case ARCH_TINY_STREAMING:   return "models\\tiny-streaming-"   + lang;
@@ -119,15 +124,20 @@ static void usage(const char *prog) {
                  "olas_win - Open Local Audio Scribe for Windows\n\n"
                  "Usage: %s [options]\n\n"
                  "  -m, --model PATH[,PATH]    Model directory per language\n"
-                 "  -a, --arch N[,N]           Architecture per language [1=Base]\n"
+                 "  -a, --arch N[,N]           Architecture per language [4=SmallStreaming]\n"
                  "  -l, --language CODE[,CODE] Comma-separated language codes [en,es]\n"
                  "  -r, --rms THRESHOLD        Silence RMS threshold [%.0f]\n"
                  "  -q, --chunk-ms MS          Capture chunk in ms [%d]\n"
                  "  -v, --verbose              Verbose logging to %s\n"
+                 "  -c, --config PATH          Transcription parameters [olas-win.conf]\n"
+                 "  --spelling LANG[,LANG]     Enable spelling mode for listed languages\n"
+                 "  --stats                    Print inference diagnostics on exit\n"
                  "  -h, --help                 Show this help\n\n"
-                 "Default architecture: SmallStreaming (TinyStreaming on <=4-thread CPUs)\n"
                  "Architecture numbers:\n"
-                 "  0=Tiny  1=Base  2=TinyStreaming  4=SmallStreaming  5=MediumStreaming\n",
+                 "  0=Tiny  1=Base  2=TinyStreaming  4=SmallStreaming  5=MediumStreaming\n"
+                 "  (3=BaseStreaming is not supported by Moonshine and is rejected.)\n\n"
+                 "Keyterms: put one term per line in contexts/active-<lang>.txt.\n"
+                 "Moonshine docs warn that lists over 20 terms cause phantom words.\n",
                  prog, DEF_SILENCE_RMS, DEFAULT_CAPTURE_CHUNK_MS, VERBOSE_LOG_FILE);
 }
 
@@ -143,13 +153,8 @@ static void on_toggle(int slot) {
 
 static void on_device(int device_index) {
     // Restart capture on the new device. Audio is dropped briefly.
-    win32_ui_post_status("switching capture device...");
     capture_stop();
-    if (!capture_start(device_index)) {
-        win32_ui_post_status("device switch failed");
-        return;
-    }
-    win32_ui_post_status("listening...");
+    capture_start(device_index);
 }
 
 // ---------------- main ----------------
@@ -161,8 +166,9 @@ int main() {
     int argc = 0;
     std::vector<std::string> argv = argv_to_utf8(argc);
 
-    std::vector<std::string> languages, models;
+    std::vector<std::string> languages, models, spelling_langs;
     std::vector<int>         arches;
+    std::string config_path = OlasConfig::default_path();
 
     for (int i = 1; i < argc; ++i) {
         const std::string &a = argv[i];
@@ -208,7 +214,14 @@ int main() {
             g_capture_chunk_ms = v;
         } else if (a == "--no-update-check") {
             g_no_update_check = true;
-
+        } else if (a == "--spelling") {
+            if (!need("--spelling")) return 1;
+            spelling_langs = split_csv(argv[++i]);
+        } else if (a == "-c" || a == "--config") {
+            if (!need("--config")) return 1;
+            config_path = argv[++i];
+        } else if (a == "--stats") {
+            g_show_stats = true;
         } else if (a == "-h" || a == "--help") {
             usage(argv[0].c_str()); return 0;
         } else {
@@ -230,11 +243,51 @@ int main() {
         return 1;
     }
 
+    // English has two models. Ask once on first run and remember the answer;
+    // the Options menu can change it later, which needs a restart.
+    bool english_active = false;
+    for (const auto &l : languages) if (l == "en") english_active = true;
+
+    if (english_active && arches.empty()) {
+        EnglishModel choice = load_english_model();
+        if (choice == EnglishModel::Unset) {
+            const int r = MessageBoxW(nullptr,
+                L"Choose the ENGLISH model.\n\n"
+                L"  Normal mode - Medium Streaming (English)\n"
+                L"                Heavier, more accurate. Uses 3 cores for "
+                L"English and 1 for Spanish.\n\n"
+                L"  Potato mode - Small Streaming (English)\n"
+                L"                Ultralight: 1 core per language, 2 total.\n"
+                L"                Lower CPU, slightly less accurate.\n\n"
+                L"Spanish always uses Small Streaming.\n\n"
+                L"Use Normal mode (Medium English)?  "
+                L"No = Potato mode (Small English).",
+                L"OLAS 1.1 - choose the English model",
+                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON1);
+            choice = (r == IDYES) ? EnglishModel::Medium
+                                  : EnglishModel::Small;
+            save_english_model(choice);
+            MessageBoxW(nullptr,
+                L"Model loaded. You can change it later from "
+                L"Options > English model.",
+                L"OLAS 1.1", MB_OK | MB_ICONINFORMATION);
+        }
+        g_english_choice = choice;
+        std::fprintf(stderr, "english model: %s (from %s)\n",
+                     english_model_name(choice), model_choice_path().c_str());
+    }
+
     if (arches.empty()) {
-        // Always default to Small Streaming. Tiny Streaming is still available
-        // via -a 2 for users on genuinely small CPUs, but Small is what we want
-        // as the out-of-the-box experience.
-        arches.assign(languages.size(), ARCH_SMALL_STREAMING);
+        // English uses the saved/asked-for choice, other languages fall back
+        // to Small Streaming; English is the only language with two models.
+        for (size_t i = 0; i < languages.size(); ++i) {
+            if (languages[i] == "en" && g_english_choice != EnglishModel::Unset)
+                arches.push_back(english_model_arch(g_english_choice));
+            else if (languages[i] == "en")
+                arches.push_back(ARCH_MEDIUM_STREAMING);
+            else
+                arches.push_back(ARCH_SMALL_STREAMING);
+        }
     } else if (arches.size() == 1 && languages.size() > 1)
         arches.assign(languages.size(), arches.front());
     else if (arches.size() != languages.size()) {
@@ -256,7 +309,21 @@ int main() {
         c.language   = languages[i];
         c.model_path = models[i];
         c.arch       = arches[i];
+        c.spelling   = std::find(spelling_langs.begin(), spelling_langs.end(),
+                                 languages[i]) != spelling_langs.end();
         g_configs.push_back(std::move(c));
+    }
+
+    {
+        std::vector<std::string> warnings;
+        g_ocfg = OlasConfig::load(config_path, warnings);
+        for (const auto &w : warnings)
+            std::fprintf(stderr, "config: %s\n", w.c_str());
+        std::fprintf(stderr,
+            "config: %s  vad=%.2f max_seg=%ds interval=%.2fs\n",
+            config_path.c_str(), g_ocfg.vad_threshold,
+            g_ocfg.vad_max_segment_duration,
+            g_ocfg.transcription_interval);
     }
 
     // Notes file: next to the exe (matches Linux behaviour).
@@ -276,6 +343,12 @@ int main() {
             for (auto &a : arches) std::fprintf(g_verbose_log, " %d", a);
             std::fprintf(g_verbose_log, "\nmodels:");
             for (auto &m : models) std::fprintf(g_verbose_log, " %s", m.c_str());
+            std::fprintf(g_verbose_log, "\nspelling:");
+            for (auto &l : languages) {
+                const bool on = std::find(spelling_langs.begin(),
+                                          spelling_langs.end(), l) != spelling_langs.end();
+                std::fprintf(g_verbose_log, " %s=%s", l.c_str(), on ? "on" : "off");
+            }
             std::fprintf(g_verbose_log, "\n\n");
             std::fflush(g_verbose_log);
         }
@@ -317,11 +390,7 @@ int main() {
     }
 
     // Start capture.
-    if (!capture_start(0)) {
-        win32_ui_post_status("capture start failed");
-    } else {
-        win32_ui_post_status("listening...");
-    }
+    capture_start(0);
 
     // Capture thread.
     CaptureArgs cargs;
@@ -335,9 +404,8 @@ int main() {
             olas::UpdateInfo info = olas::check_for_updates(OLAS_UPDATE_REPO, 5000);
             if (info.completed && info.outdated) {
                 win32_ui_show_update_prompt(
-                    olas::build_commit_sha(),
-                                            info.remote_sha.c_str(),
-                                            info.html_url.c_str());
+                    info.tag_name.c_str(), info.release_name.c_str(),
+                    olas::build_git_branch(), info.html_url.c_str());
             }
         }).detach();
     }
@@ -345,7 +413,6 @@ int main() {
     // Message loop (blocks until the main window closes).
     win32_ui_run(on_toggle, on_device);
 
-    // Shutdown.
     // Shutdown.
     g_running.store(false);
     capture_stop();
@@ -356,6 +423,22 @@ int main() {
 
     win32_ui_shutdown();
     capture_uninit();
+
+    if (g_show_stats) {
+        for (size_t i = 0; i < languages.size() && i < engine.size(); ++i) {
+            const auto st = engine.get_stats((int)i);
+            std::fprintf(stderr, "\n=== Slot %zu (%s) ===\n", i, languages[i].c_str());
+            std::fprintf(stderr, "  chunks_pushed      : %llu\n",
+                         (unsigned long long)st.chunks_pushed);
+            std::fprintf(stderr, "  chunks_processed   : %llu\n",
+                         (unsigned long long)st.chunks_processed);
+            std::fprintf(stderr, "  queue_depth        : %llu\n",
+                         (unsigned long long)st.queue_depth);
+            std::fprintf(stderr, "  queue_max_depth    : %llu\n",
+                         (unsigned long long)st.queue_max_depth);
+            std::fprintf(stderr, "  inference_rtf      : %.3f\n", st.inference_rtf);
+        }
+    }
 
     if (g_verbose_log) { std::fclose(g_verbose_log); g_verbose_log = nullptr; }
     if (g_notes) { std::fclose(g_notes); g_notes = nullptr; }

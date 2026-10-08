@@ -1,25 +1,8 @@
 // win32_ui.cpp — Win32 UI for OLAS (one pane per language).
 //
-// Layout:
-//   banner:   [OLAS] title strip
-//   row 1:    [Options v] [Restore] [EN] [buttons]  [ES] [buttons]
-//   panes:    one RichEdit per language, side by side
-//   status:   bottom status bar
-//
-// The Options / Restore buttons live in a small dedicated overlay window
-// (g_toolbar_overlay) that is a child of the main window. The overlay is
-// placed on top of the first docked pane's header row and raised in the
-// main window's sibling z-order once per layout.
-//
-// Options is a popup menu (TrackPopupMenu).
-//
-// Auto-scroll: each pane tracks follow_tail. When true, new content scrolls
-// the RichEdit to the bottom. The user disengages by scrolling up; it
-// re-engages when they scroll back to the bottom. The Options menu has an
-// "Auto-scroll output" command that forces all panes back to following.
-//
-// All buttons use a custom class (OLASButton) with rounded corners and
-// theme-aware colors, since stock Windows buttons look wrong in dark mode.
+// A slim title strip, a toolbar overlay carrying Options/Restore, and one
+// RichEdit per language side by side. Buttons use a custom class
+// (OLASButton) because stock Windows buttons look wrong in dark mode.
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -44,6 +27,7 @@
 #include <vector>
 
 #include "win32_ui.h"
+#include "model_choice.h"
 #include "capture.h"
 
 #ifndef DWMWA_CAPTION_COLOR
@@ -64,7 +48,6 @@ static void load_richedit(void) {
 // ---------------- messages ----------------
 
 #define WM_APP_UPDATE       (WM_APP + 1)
-#define WM_APP_STATUS       (WM_APP + 2)
 #define WM_APP_UPDATE_AVAIL (WM_APP + 3)
 
 // ---------------- IDs ----------------
@@ -72,7 +55,6 @@ static void load_richedit(void) {
 enum {
     ID_TOGGLE    = 101,
     ID_DECOUPLE  = 102,
-    ID_STATUS    = 106,
     ID_EDIT      = 107,
     ID_COLLAPSE  = 108,
     ID_OPTIONS   = 109,
@@ -94,6 +76,8 @@ enum {
     IDM_THEME_LIGHT   = 4001,
     IDM_THEME_DARK    = 4002,
     IDM_AUTOSCROLL_ON = 5001,
+    IDM_MODEL_MEDIUM  = 6001,
+    IDM_MODEL_SMALL   = 6002,
 };
 
 // ---------------- theme ----------------
@@ -103,17 +87,20 @@ struct Theme {
     COLORREF btn_bg, btn_bg_hover, btn_bg_pressed, btn_fg, btn_border, btn_accent;
 };
 
+// The banner is a slim label strip, not a coloured slab: the accent colour is
+// kept for the text only, so it reads as a heading rather than a bar. Pane
+// text gets the full window background so the transcript is what stands out.
 static const Theme THEME_LIGHT = {
-    RGB(0xFF,0xFF,0xFF), RGB(0x00,0x00,0x00), RGB(0x77,0x77,0x77),
-    RGB(0xF0,0xF0,0xF0), RGB(0x1F,0x6F,0x78), RGB(0xFF,0xFF,0xFF),
-    RGB(0xE8,0xE8,0xE8), RGB(0xDD,0xDD,0xDD), RGB(0xCC,0xCC,0xCC),
-    RGB(0x20,0x20,0x20), RGB(0xC8,0xC8,0xC8), RGB(0x1F,0x6F,0x78)
+    RGB(0xFF,0xFF,0xFF), RGB(0x1A,0x1A,0x1A), RGB(0x8A,0x8A,0x8A),
+    RGB(0xFA,0xFA,0xFA), RGB(0xEC,0xEC,0xEC), RGB(0x1F,0x6F,0x78),
+    RGB(0xF2,0xF2,0xF2), RGB(0xE6,0xE6,0xE6), RGB(0xDC,0xDC,0xDC),
+    RGB(0x24,0x24,0x24), RGB(0xD8,0xD8,0xD8), RGB(0x1F,0x6F,0x78)
 };
 static const Theme THEME_DARK = {
-    RGB(0x1E,0x1E,0x1E), RGB(0xE8,0xE8,0xE8), RGB(0x90,0x90,0x90),
-    RGB(0x2A,0x2A,0x2A), RGB(0x14,0x4A,0x50), RGB(0xF0,0xF0,0xF0),
-    RGB(0x3A,0x3A,0x3A), RGB(0x4A,0x4A,0x4A), RGB(0x2E,0x2E,0x2E),
-    RGB(0xE8,0xE8,0xE8), RGB(0x55,0x55,0x55), RGB(0x1F,0x6F,0x78)
+    RGB(0x1E,0x1E,0x1E), RGB(0xE8,0xE8,0xE8), RGB(0x8A,0x8A,0x8A),
+    RGB(0x24,0x24,0x24), RGB(0x2A,0x2A,0x2A), RGB(0x5F,0xC9,0xD0),
+    RGB(0x33,0x33,0x33), RGB(0x40,0x40,0x40), RGB(0x2A,0x2A,0x2A),
+    RGB(0xE2,0xE2,0xE2), RGB(0x4A,0x4A,0x4A), RGB(0x2F,0x8E,0x96)
 };
 static Theme  g_theme            = THEME_DARK;
 static bool   g_dark_mode        = true;   // dark by default
@@ -304,18 +291,6 @@ static void button_set_text(HWND btn, const wchar_t *text) {
     if (btn) SendMessageW(btn, WM_SETTEXT, 0, (LPARAM)text);
 }
 
-static void button_set_toggled(HWND btn, bool on) {
-    if (!btn) return;
-    BtnData *d = (BtnData *)GetWindowLongPtrW(btn, GWLP_USERDATA);
-    if (d) { d->toggled = on; InvalidateRect(btn, nullptr, FALSE); }
-}
-
-static bool button_get_toggled(HWND btn) {
-    if (!btn) return false;
-    BtnData *d = (BtnData *)GetWindowLongPtrW(btn, GWLP_USERDATA);
-    return d ? d->toggled : false;
-}
-
 // ---------------- state ----------------
 
 struct LogLine {
@@ -336,6 +311,7 @@ struct Pane {
     HWND toggle_btn   = nullptr;
     HWND detach_btn   = nullptr;
     HWND edit         = nullptr;
+    WNDPROC edit_old_proc = nullptr;   // per-pane, not global — avoids cross-pane overwrite
 
     HWND float_window = nullptr;
 
@@ -358,14 +334,15 @@ struct Update {
     bool  is_error;
 };
 struct UpdateAvail {
-    std::string local_sha;
-    std::string remote_sha;
-    std::string url;
+    std::string tag;      // release tag, e.g. "v1.1.0"
+    std::string name;     // release title, may be empty
+    std::string local;    // this build's branch/version label
+    std::string url;      // release page to open
 };
 
 static HWND        g_main_window      = nullptr;
 static HWND        g_toolbar_overlay  = nullptr;
-static HWND        g_status           = nullptr;
+
 static HFONT       g_font_mono        = nullptr;
 static HFONT       g_font_ui          = nullptr;
 
@@ -382,14 +359,10 @@ static int   g_toolbar_w          = 0;
 static olas_toggle_fn g_on_toggle = nullptr;
 static olas_device_fn g_on_device = nullptr;
 
-// Old RichEdit proc for the subclass
-static WNDPROC g_edit_old_proc = nullptr;
-
 // ---------------- forward declarations ----------------
 
 static inline int D(int px);
 static wchar_t *a2w(const char *s);
-static void set_status_w(const wchar_t *w);
 static void pane_layout(Pane *p);
 static void pane_rerender(Pane *p);
 static void pane_set_collapsed(Pane *p, bool collapsed);
@@ -418,9 +391,7 @@ static wchar_t *a2w(const char *s) {
     return w;
 }
 
-static void set_status_w(const wchar_t *w) {
-    if (g_status) SendMessageW(g_status, SB_SETTEXTW, 0, (LPARAM)w);
-}
+
 
 static inline HBRUSH bg_brush(void) {
     return g_window_brush ? g_window_brush : (HBRUSH)(COLOR_BTNFACE + 1);
@@ -486,7 +457,9 @@ static bool edit_is_at_bottom(HWND edit) {
 static LRESULT CALLBACK edit_subclass_proc(HWND hwnd, UINT msg,
                                            WPARAM wp, LPARAM lp) {
     Pane *p = (Pane *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-    LRESULT r = CallWindowProcW(g_edit_old_proc, hwnd, msg, wp, lp);
+    WNDPROC old_proc = (p && p->edit_old_proc) ? p->edit_old_proc
+                                               : (WNDPROC)DefWindowProcW;
+    LRESULT r = CallWindowProcW(old_proc, hwnd, msg, wp, lp);
 
     const bool user_scrolled =
         msg == WM_VSCROLL ||
@@ -569,6 +542,19 @@ static void pane_layout(Pane *p) {
     MoveWindow(p->edit, pad, h_row,
                r.right - 2 * pad,
                r.bottom - h_row - pad, TRUE);
+
+    // EM_SETRECTNP is one-shot: re-apply after every resize, or the padding
+    // is lost the first time the window is resized.
+    {
+        RECT er;
+        GetClientRect(p->edit, &er);
+        const int px = D(8), py = D(6);
+        RECT inset{ er.left + px, er.top + py,
+                    er.right - px, er.bottom - py };
+        if (inset.right <= inset.left) inset.right = inset.left + 1;
+        if (inset.bottom <= inset.top) inset.bottom = inset.top + 1;
+        SendMessageW(p->edit, EM_SETRECTNP, 0, (LPARAM)&inset);
+    }
 }
 
 // ---------------- pane rendering ----------------
@@ -710,7 +696,10 @@ static void pane_set_collapsed(Pane *p, bool collapsed) {
 static void pane_detach(Pane *p) {
     if (!p || p->float_window) return;
     if (g_floated_pane && g_floated_pane != p) {
-        set_status_w(L"Only one pane can be decoupled at a time \u2014 recouple it first.");
+        MessageBoxW(g_main_window,
+                    L"Only one pane can be decoupled at a time - recouple it "
+                    L"first.",
+                    L"OLAS 1.1", MB_OK | MB_ICONINFORMATION);
         return;
     }
     if (g_collapsed_pane == p) pane_set_collapsed(p, false);
@@ -828,9 +817,24 @@ static void pane_create_controls(Pane *p, HINSTANCE hInst) {
     SendMessageW(p->edit, EM_SETBKGNDCOLOR, 0, (LPARAM)g_theme.bg);
     SendMessageW(p->edit, EM_SETTARGETDEVICE, 0, 0);
 
-    // Subclass so we can detect user-initiated scrolls.
+    // Inner padding. RichEdit clips text to the client rect by default, so on
+    // a maximised window the first line touches the top edge and the left
+    // edge. EM_SETRECTNP reserves a margin on all four sides.
+    {
+        RECT rc;
+        GetClientRect(p->edit, &rc);
+        const int pad_x = D(8), pad_y = D(6);
+        RECT inset{ rc.left + pad_x, rc.top + pad_y,
+                    rc.right - pad_x, rc.bottom - pad_y };
+        if (inset.right <= inset.left) inset.right = inset.left + 1;
+        if (inset.bottom <= inset.top) inset.bottom = inset.top + 1;
+        SendMessageW(p->edit, EM_SETRECTNP, 0, (LPARAM)&inset);
+    }
+
+    // Subclass so we can detect user-initiated scrolls. Store the old proc
+    // per-pane so creating a second pane does not clobber the first one's.
     SetWindowLongPtrW(p->edit, GWLP_USERDATA, (LONG_PTR)p);
-    g_edit_old_proc = (WNDPROC)SetWindowLongPtrW(
+    p->edit_old_proc = (WNDPROC)SetWindowLongPtrW(
         p->edit, GWLP_WNDPROC, (LONG_PTR)edit_subclass_proc);
 }
 
@@ -943,7 +947,11 @@ static LRESULT CALLBACK banner_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, g_theme.banner_text);
         HFONT old = (HFONT)SelectObject(dc, g_font_banner);
-        DrawTextW(dc, L"OLAS", -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        // Left-aligned heading, not a centred slab.
+        RECT tr = r;
+        tr.left += D(12);
+        DrawTextW(dc, L"OLAS", -1, &tr,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         SelectObject(dc, old);
         EndPaint(hwnd, &ps);
         return 0;
@@ -992,10 +1000,15 @@ static void apply_theme(void) {
     }
 
     if (g_main_window) {
-        COLORREF cap_bg   = g_theme.banner_bg;
-        COLORREF cap_text = RGB(0xFF, 0xFF, 0xFF);
+        // Caption follows the window background, not the accent, so the frame
+        // does not compete with the transcript. DWMWA_USE_IMMERSIVE_DARK_MODE
+        // makes the system draw its own light-on-dark caption controls.
+        COLORREF cap_bg   = g_theme.window_bg;
+        COLORREF cap_text = g_theme.text;
+        BOOL dark = g_dark_mode ? TRUE : FALSE;
         DwmSetWindowAttribute(g_main_window, DWMWA_CAPTION_COLOR, &cap_bg, sizeof(cap_bg));
         DwmSetWindowAttribute(g_main_window, DWMWA_TEXT_COLOR,   &cap_text, sizeof(cap_text));
+        DwmSetWindowAttribute(g_main_window, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark, sizeof(dark));
     }
 
     // Force every custom button to repaint with the new palette.
@@ -1079,6 +1092,21 @@ static void show_options_menu(void) {
                 IDM_THEME_DARK,  L"Dark");
     AppendMenuW(menu, MF_POPUP | MF_STRING, (UINT_PTR)theme_menu, L"Appearance");
 
+    // English model. Changing it needs a restart, so the choice is saved and
+    // the user is told to relaunch.
+    HMENU model_menu = CreatePopupMenu();
+    const olas::EnglishModel cur = olas::load_english_model();
+    AppendMenuW(model_menu, MF_STRING |
+                (cur == olas::EnglishModel::Medium ? MF_CHECKED : 0),
+                IDM_MODEL_MEDIUM,
+                L"Normal mode - Medium English   (3+1 cores)");
+    AppendMenuW(model_menu, MF_STRING |
+                (cur == olas::EnglishModel::Small ? MF_CHECKED : 0),
+                IDM_MODEL_SMALL,
+                L"Potato mode - Small English    (1+1 cores)");
+    AppendMenuW(menu, MF_POPUP | MF_STRING, (UINT_PTR)model_menu,
+                L"English model");
+
     HWND btn = g_toolbar_overlay ? GetDlgItem(g_toolbar_overlay, ID_OPTIONS) : nullptr;
     RECT br = {0};
     if (btn) GetWindowRect(btn, &br);
@@ -1112,6 +1140,24 @@ static void show_options_menu(void) {
     } else if (cmd == IDM_THEME_LIGHT || cmd == IDM_THEME_DARK) {
         bool dark = (cmd == IDM_THEME_DARK);
         if (dark != g_dark_mode) { g_dark_mode = dark; apply_theme(); }
+    } else if (cmd == IDM_MODEL_MEDIUM || cmd == IDM_MODEL_SMALL) {
+        const olas::EnglishModel want = (cmd == IDM_MODEL_MEDIUM)
+                                            ? olas::EnglishModel::Medium
+                                            : olas::EnglishModel::Small;
+        if (want == olas::load_english_model()) return;   // no change
+        if (!olas::save_english_model(want)) {
+            MessageBoxW(g_main_window,
+                L"Could not save the model choice next to the program.",
+                L"OLAS", MB_OK | MB_ICONWARNING);
+            return;
+        }
+        MessageBoxW(g_main_window,
+            (want == olas::EnglishModel::Medium)
+                ? L"Normal mode saved (Medium English).\n\n"
+                  L"Restart OLAS 1.1 to apply the change."
+                : L"Potato mode saved (Small English).\n\n"
+                  L"Restart OLAS 1.1 to apply the change.",
+            L"OLAS 1.1", MB_OK | MB_ICONINFORMATION);
     }
 }
 
@@ -1123,15 +1169,10 @@ static void main_layout(void) {
     const int pad      = D(8);
     const int gap      = D(6);
     const int h_row    = D(30);
-    const int banner_h = D(36);
+    const int banner_h = D(26);   // slim heading strip, was 36
 
     if (g_banner) MoveWindow(g_banner, 0, 0, r.right, banner_h, TRUE);
 
-    int status_h = 0;
-    if (g_status) {
-        RECT sr; GetWindowRect(g_status, &sr);
-        status_h = sr.bottom - sr.top;
-    }
 
     const int toolbar_y = banner_h + pad;
     const int bw_opts   = D(100);
@@ -1142,7 +1183,7 @@ static void main_layout(void) {
 
     const int pane_x0 = pad;
     const int pane_y  = toolbar_y;
-    int pane_h = r.bottom - pane_y - pad - status_h;
+    int pane_h = r.bottom - pane_y - pad;
     if (pane_h < D(60)) pane_h = D(60);
 
     int n_docked = 0;
@@ -1244,12 +1285,6 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
 
-        case WM_APP_STATUS: {
-            wchar_t *w = (wchar_t *)lp;
-            if (w) { set_status_w(w); free(w); }
-            return 0;
-        }
-
         case WM_GETMINMAXINFO: {
             MINMAXINFO *m = (MINMAXINFO *)lp;
             // Big enough for two panes + toolbar + buttons without clipping.
@@ -1267,14 +1302,25 @@ static LRESULT CALLBACK main_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_APP_UPDATE_AVAIL: {
             UpdateAvail *ua = (UpdateAvail *)lp;
             if (ua) {
-                std::wstring msg =
-                    L"A newer version of OLAS is available.\n\n"
-                    L"  Your build:    ";
-                { wchar_t buf[32]; wsprintfW(buf, L"%.12s", ua->local_sha.c_str()); msg += buf; }
-                msg += L"\n  Latest (main): ";
-                { wchar_t buf[32]; wsprintfW(buf, L"%.12s", ua->remote_sha.c_str()); msg += buf; }
-                msg += L"\n\nOpen the project page in your browser "
-                       L"to download the update?";
+                /* Convert the narrow (UTF-8) strings once and build the
+                 * message from wide text.  Do not pass a char* to a %s in a
+                 * wide format string: it is reinterpreted as UTF-16 and the
+                 * dialog shows garbage. */
+                std::wstring msg = L"A newer version of OLAS is available.\n\n  ";
+                if (!ua->name.empty()) {
+                    wchar_t *n = a2w(ua->name.c_str());
+                    if (n) { msg += n; msg += L"  ("; free(n); }
+                }
+                wchar_t *tag = a2w(ua->tag.c_str());
+                if (tag) { msg += tag; free(tag); }
+                if (!ua->name.empty()) msg += L")";
+
+                msg += L"\n  Your build: ";
+                wchar_t *local = a2w(ua->local.c_str());
+                if (local) { msg += local; free(local); }
+
+                msg += L"\n\nOpen the release page in your browser to "
+                       L"download it?";
 
                 int r = MessageBoxW(g_main_window, msg.c_str(),
                                     L"Update Available",
@@ -1441,11 +1487,8 @@ int win32_ui_init(const std::vector<std::string> &languages) {
     create_button(g_toolbar_overlay, ID_RESTORE, L"Restore",
                   BtnKind::Push, hInst, bw_opts + gap, 0, bw_rst, h_row);
 
-    g_status = CreateWindowExW(
-        0, STATUSCLASSNAMEW, nullptr,
-        WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP,
-        0, 0, 0, 0, g_main_window, (HMENU)ID_STATUS, hInst, nullptr);
-    set_status_w(L"ready");
+    // No status bar: its "listening..." text did not blend with the rest of
+    // the UI. Transient problems are reported through the panes instead.
 
     /* Panes */
     for (size_t i = 0; i < languages.size(); ++i) {
@@ -1495,11 +1538,10 @@ void win32_ui_post_update(int slot, const char *prefix, const char *body,
     PostMessageW(g_main_window, WM_APP_UPDATE, 0, (LPARAM)u);
 }
 
+// The status bar was removed; transient messages go to stderr instead of a
+// UI element that would not blend with the panes.
 void win32_ui_post_status(const char *text) {
-    if (!g_main_window || !text) return;
-    wchar_t *w = a2w(text);
-    if (!w) return;
-    PostMessageW(g_main_window, WM_APP_STATUS, 0, (LPARAM)w);
+    if (text && *text) std::fprintf(stderr, "[olas] %s\n", text);
 }
 
 void win32_ui_set_pane_enabled(int slot, int enabled) {
@@ -1509,15 +1551,15 @@ void win32_ui_set_pane_enabled(int slot, int enabled) {
     button_set_text(p->toggle_btn, p->enabled ? L"\u23F9" : L"\u25B6");
 }
 
-void win32_ui_show_update_prompt(const char* local_sha,
-                                 const char* remote_sha,
-                                 const char* url)
+void win32_ui_show_update_prompt(const char* tag, const char* name,
+                                 const char* local, const char* url)
 {
     if (!g_main_window) return;
     UpdateAvail *ua = new UpdateAvail();
-    ua->local_sha  = local_sha  ? local_sha  : "";
-    ua->remote_sha = remote_sha ? remote_sha : "";
-    ua->url        = url        ? url        : "";
+    ua->tag   = tag   ? tag   : "";
+    ua->name  = name  ? name  : "";
+    ua->local = local ? local : "";
+    ua->url   = url   ? url   : "";
     PostMessageW(g_main_window, WM_APP_UPDATE_AVAIL, 0, (LPARAM)ua);
 }
 
