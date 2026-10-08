@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(OLAS VERSION 0.5.0 LANGUAGES C CXX)
+project(OLAS VERSION 1.1.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -27,10 +27,14 @@ set(ONNXRUNTIME_ROOT "C:/onnxruntime" CACHE PATH "Path to prebuilt ONNX Runtime"
 # ---------------------------------------------------------------------------
 include(FetchContent)
 
+# Pinned to a specific Moonshine release so builds are reproducible.
+# Update deliberately after testing compatibility.
+set(MOONSHINE_GIT_TAG "v0.0.69" CACHE STRING "Moonshine tag or commit to build against")
+
 FetchContent_Declare(
     moonshine
     GIT_REPOSITORY https://github.com/moonshine-ai/moonshine.git
-    GIT_TAG main
+    GIT_TAG ${MOONSHINE_GIT_TAG}
     GIT_SHALLOW TRUE
     SOURCE_SUBDIR core
 )
@@ -119,9 +123,9 @@ endif()
 
 string(TIMESTAMP OLAS_BUILD_DATE "%Y-%m-%d %H:%M:%S UTC" UTC)
 
-# GitHub repo to check for updates. "owner/name" form.
+# GitHub repo whose *releases* are checked for updates. "owner/name" form.
 # Leave EMPTY to disable the update check entirely.
-set(OLAS_UPDATE_REPO "Igna-Mendez/Olas" CACHE STRING
+set(OLAS_UPDATE_REPO "Igna-Mendez/Open-Local-Audio-Scribe-OLAS" CACHE STRING
     "GitHub repo (owner/name) for update checks; empty to disable")
 
 # ---------------------------------------------------------------------------
@@ -132,6 +136,8 @@ add_executable(olas_win WIN32
     src/capture.c
     src/win32_ui.cpp
     src/moonshine_engine.cpp
+    src/resource_plan.cpp
+    src/model_choice.cpp
     src/miniaudio_impl.c
     src/update_check.cpp
 )
@@ -272,7 +278,7 @@ add_custom_target(dist
     # Runtime DLL
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${ORT_DLL_SOURCE}" "${DIST_DIR}/onnxruntime.dll"
-    # Models (base-en, base-es, small-streaming-en, whatever's in models/)
+    # Models: whatever fetch-streaming-models.ps1 put in models/
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             "${CMAKE_SOURCE_DIR}/models" "${DIST_DIR}/models"
     # Launcher + docs
@@ -282,6 +288,9 @@ add_custom_target(dist
             "${CMAKE_SOURCE_DIR}/README.md"  "${DIST_DIR}/README.md"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/LICENSE"    "${DIST_DIR}/LICENSE"
+    # 0.6 runtime tuning (transcription parameters)
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/olas-win.conf" "${DIST_DIR}/olas-win.conf"
     DEPENDS olas_win
     COMMENT "Packaging OLAS-win64 distribution folder into ${DIST_DIR}"
     VERBATIM
