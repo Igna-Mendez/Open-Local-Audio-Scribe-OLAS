@@ -195,17 +195,11 @@ UpdateInfo check_for_updates(const std::string& owner_repo, int timeout_ms) {
         return info;
     }
 
-    /* Built without git -> we don't know our own SHA, skip. */
-    std::string local_sha = build_commit_sha();
-    if (local_sha.empty() || local_sha == "unknown") {
-        info.error = "local build has no git SHA";
-        return info;
-    }
-
-    /* Find the default branch tip.  We use the commits API for `main`; if
-     * your repo's default branch is `master`, change this string. */
+    /* Ask for the latest *release*, not a branch tip.  A branch tip moves on
+     * every commit, so comparing against it reports an update for work that
+     * was never published as a build. */
     std::wstring host = L"api.github.com";
-    std::string path_utf8 = "/repos/" + owner_repo + "/commits/main";
+    std::string path_utf8 = "/repos/" + owner_repo + "/releases/latest";
     std::wstring path = u8_to_w(path_utf8);
 
     std::string err;
@@ -215,16 +209,32 @@ UpdateInfo check_for_updates(const std::string& owner_repo, int timeout_ms) {
         return info;
     }
 
-    std::string remote = json_first_string(body, "sha");
-    if (remote.empty()) {
-        info.error = "could not parse 'sha' from response";
+    /* GitHub answers 404 with {"message":"Not Found"} when a repository has
+     * no published releases.  That is not an error worth reporting. */
+    if (body.find("\"message\"") != std::string::npos &&
+        body.find("\"tag_name\"") == std::string::npos) {
+        info.error = "no releases published";
         return info;
     }
 
-    info.completed  = true;
-    info.remote_sha = remote;
-    info.html_url   = repo_web_url(owner_repo);
-    info.outdated   = (remote != local_sha);
+    const std::string tag = json_first_string(body, "tag_name");
+    if (tag.empty()) {
+        info.error = "could not parse 'tag_name' from response";
+        return info;
+    }
+
+    info.completed    = true;
+    info.tag_name     = tag;
+    info.release_name = json_first_string(body, "name");
+    info.html_url     = json_first_string(body, "html_url");
+    if (info.html_url.empty())
+        info.html_url = repo_web_url(owner_repo) + "/releases";
+
+    /* Outdated when the published tag differs from the tag this build was
+     * made from.  Builds with no git info cannot tell, so they are treated
+     * as up to date rather than nagging. */
+    const std::string local = build_git_branch();
+    info.outdated = (local == "unknown") ? false : (tag != local);
 
     return info;
 }

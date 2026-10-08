@@ -13,15 +13,20 @@ const char* build_timestamp();
 /* Result of an update check. */
 struct UpdateInfo {
     bool        completed   = false;  /* did the HTTP round-trip finish?  */
-    bool        outdated    = false;  /* remote SHA differs from ours?    */
-    std::string remote_sha;           /* 40-char hex, empty on error      */
-    std::string html_url;             /* browse URL for the user          */
+    bool        outdated    = false;  /* is the published release newer?  */
+    std::string tag_name;             /* release tag, e.g. "v1.1.0"       */
+    std::string release_name;         /* release title, may be empty      */
+    std::string html_url;             /* release page to open             */
     std::string error;                /* human-readable, empty on success */
 };
 
 /* Blocking.  Call from a worker thread.  timeout_ms applies to each of
  * connect / send / receive separately.  Returns an UpdateInfo with
- * completed=false and a populated error on failure. */
+ * completed=false and a populated error on failure.
+ *
+ * Queries the repository's latest GitHub *release*, not the tip of a branch:
+ * a branch tip moves with every commit, so comparing against it reports an
+ * update for work that was never published. */
 UpdateInfo check_for_updates(const std::string& owner_repo,
                              int timeout_ms = 5000);
 
