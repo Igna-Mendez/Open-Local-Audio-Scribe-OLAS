@@ -290,7 +290,9 @@ add_custom_target(dist
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/OLAS.bat"   "${DIST_DIR}/OLAS.bat"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_SOURCE_DIR}/README.md"  "${DIST_DIR}/README.md"
+            "${CMAKE_SOURCE_DIR}/README.md"    "${DIST_DIR}/README.md"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/PATCHNOTES.md" "${DIST_DIR}/PATCHNOTES.md"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/LICENSE"    "${DIST_DIR}/LICENSE"
     # Runtime tuning (transcription parameters); shipped as a default the
