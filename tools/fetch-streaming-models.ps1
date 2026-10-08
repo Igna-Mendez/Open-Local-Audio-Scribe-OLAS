@@ -3,6 +3,8 @@
 param(
     [string[]]$Languages = @("en", "es"),
     [string]$Version = "",
+    [ValidateSet("default", "small", "medium")]
+    [string]$Set = "default",
     [switch]$Force
 )
 
@@ -22,6 +24,19 @@ $scriptDir = $PSScriptRoot
 if (-not $scriptDir) { $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
 $root = Split-Path -Parent $scriptDir
 $modelsRoot = Join-Path $root "models"
+
+# ---- per-language model family (matches the app defaults) ----
+# The Windows app defaults English to Medium Streaming (arch 5) and every
+# other language to Small Streaming (arch 4), so the default fetch set is
+# medium-streaming-en + small-streaming-<lang> for the rest. Override per
+# language with -Set small|medium (applies to every requested language).
+function Get-Family([string]$lang) {
+    switch ($Set) {
+        "small"  { return "small-streaming" }
+        "medium" { return "medium-streaming" }
+        default  { return ($lang -eq "en") ? "medium-streaming" : "small-streaming" }
+    }
+}
 
 # ---- known quantized folder names ----
 # Moonshine publishes a new dated folder periodically. The script probes these
@@ -57,12 +72,12 @@ function Test-Url([string]$url) {
     }
 }
 
-function Resolve-Version([string]$lang, [string]$explicit) {
+function Resolve-Version([string]$family, [string]$lang, [string]$explicit) {
     if ($explicit) { return $explicit }
 
-    Write-Host "  probing available quantized folders..."
+    Write-Host "  probing available quantized folders for $family-$lang..."
     foreach ($v in $KnownVersions) {
-        $probe = "https://download.moonshine.ai/model/small-streaming-$lang/$v/streaming_config.json"
+        $probe = "https://download.moonshine.ai/model/$family-$lang/$v/streaming_config.json"
         Write-Host "    try $v ..." -NoNewline
         if (Test-Url $probe) {
             Write-Host " OK"
@@ -70,18 +85,19 @@ function Resolve-Version([string]$lang, [string]$explicit) {
         }
         Write-Host " 404"
     }
-    throw "No valid quantized_* folder found for small-streaming-$lang. " +
-          "Check https://download.moonshine.ai/model/small-streaming-$lang/ " +
+    throw "No valid quantized_* folder found for $family-$lang. " +
+          "Check https://download.moonshine.ai/model/$family-$lang/ " +
           "and add the current folder name to `$KnownVersions at the top of this script."
 }
 
 function Fetch-Model([string]$lang, [string]$forcedVersion) {
-    $version = Resolve-Version $lang $forcedVersion
-    $base = "https://download.moonshine.ai/model/small-streaming-$lang/$version"
-    $dst  = Join-Path $modelsRoot "small-streaming-$lang"
+    $family  = Get-Family $lang
+    $version = Resolve-Version $family $lang $forcedVersion
+    $base = "https://download.moonshine.ai/model/$family-$lang/$version"
+    $dst  = Join-Path $modelsRoot "$family-$lang"
 
     Write-Host ""
-    Write-Host "== small-streaming-$lang ==" -ForegroundColor Cyan
+    Write-Host "== $family-$lang ==" -ForegroundColor Cyan
     Write-Host "   version: $version"
     Write-Host "   source : $base"
     Write-Host "   target : $dst"
@@ -109,7 +125,7 @@ function Fetch-Model([string]$lang, [string]$forcedVersion) {
     }
 }
 
-Write-Host "Fetching Small Streaming models into $modelsRoot"
+Write-Host "Fetching streaming models into $modelsRoot"
 foreach ($lang in $Languages) {
     Fetch-Model $lang $Version
 }
@@ -118,7 +134,8 @@ Write-Host ""
 Write-Host "Verifying..." -ForegroundColor Cyan
 $all_ok = $true
 foreach ($lang in $Languages) {
-    $dst = Join-Path $modelsRoot "small-streaming-$lang"
+    $family = Get-Family $lang
+    $dst = Join-Path $modelsRoot "$family-$lang"
     foreach ($f in $Files) {
         $p = Join-Path $dst $f
         if (-not (Test-Path $p) -or (Get-Item $p).Length -eq 0) {
