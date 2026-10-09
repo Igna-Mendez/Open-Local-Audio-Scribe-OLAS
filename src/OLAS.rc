@@ -1,0 +1,14 @@
+// OLAS.rc — Windows resource script.
+//
+// Puts the application icon into olas_win.exe, so Explorer, the taskbar, the
+// title bar and the alt-tab switcher show it instead of the default
+// executable icon.
+//
+// MAINICON is a conventional name for the lowest-numbered icon resource; the
+// loader picks it automatically for the application icon without any Win32
+// call. Keeping it first also means SetClassLongPtr(hwnd, GCLP_HICON, ...)
+// would find the same one if it were ever needed.
+
+#include <windows.h>
+
+MAINICON ICON "OLAS.ico"

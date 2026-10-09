@@ -10,6 +10,12 @@ const char* build_commit_sha();
 const char* build_git_branch();
 const char* build_timestamp();
 
+/* This build's version, from project(OLAS VERSION ...) in CMakeLists.
+ * Empty if the build did not bake one in. This is what the update check
+ * compares against the published release tag -- the git branch is not a
+ * version and must not be used for that. */
+const char* build_version();
+
 /* Result of an update check. */
 struct UpdateInfo {
     bool        completed   = false;  /* did the HTTP round-trip finish?  */

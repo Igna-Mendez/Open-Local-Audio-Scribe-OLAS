@@ -26,10 +26,14 @@ namespace olas {
 #ifndef OLAS_UPDATE_REPO
 #define OLAS_UPDATE_REPO ""
 #endif
+#ifndef OLAS_VERSION
+#define OLAS_VERSION ""
+#endif
 
 const char* build_commit_sha(void) { return OLAS_GIT_SHA; }
 const char* build_git_branch(void) { return OLAS_GIT_BRANCH; }
 const char* build_timestamp(void)  { return OLAS_BUILD_DATE; }
+const char* build_version(void)    { return OLAS_VERSION; }
 
 /* ---- UTF-8 <-> UTF-16 ---- */
 
@@ -152,6 +156,52 @@ static std::string winhttp_get(const std::wstring& host,
  * GitHub's commits API where `sha` appears once at the top level before any
  * nested occurrences. */
 
+static std::vector<int> parse_version(const std::string& s)
+{
+    std::vector<int> parts;
+    size_t i = 0;
+
+    /* Skip anything that is not a digit, so a leading "v", a leading
+     * "release", or a trailing "Release" does not matter. Examples:
+     *   "v1.1.0"    -> {1,1,0}
+     *   "1.1Release" -> {1,1}
+     *   "release0.6" -> {0,6}
+     * Anything with no digits at all yields an empty vector. */
+    while (i < s.size()) {
+        if (s[i] >= '0' && s[i] <= '9') {
+            long val = 0;
+            while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
+                val = val * 10 + (s[i] - '0');
+                if (val > 1000000) val = 1000000; /* clamp, avoid overflow */
+                ++i;
+            }
+            parts.push_back((int)val);
+            /* Skip a single separator so "1.1" counts as two numbers, not
+             * one run of digits. */
+            if (i < s.size() && (s[i] == '.' || s[i] == '-' || s[i] == '_'))
+                ++i;
+        } else {
+            ++i;
+        }
+    }
+    return parts;
+}
+
+/* True when release version `a` is strictly newer than build version `b`.
+ * Missing trailing components count as zero, so 1.1 == 1.1.0 and 1.1.1
+ * (a local build ahead of the last release) is NOT newer. */
+static bool version_is_newer(const std::vector<int>& a,
+                             const std::vector<int>& b)
+{
+    size_t n = a.size() > b.size() ? a.size() : b.size();
+    for (size_t k = 0; k < n; ++k) {
+        int av = k < a.size() ? a[k] : 0;
+        int bv = k < b.size() ? b[k] : 0;
+        if (av != bv) return av > bv;
+    }
+    return false;
+}
+
 static std::string json_first_string(const std::string& json,
                                      const std::string& key)
 {
@@ -230,11 +280,34 @@ UpdateInfo check_for_updates(const std::string& owner_repo, int timeout_ms) {
     if (info.html_url.empty())
         info.html_url = repo_web_url(owner_repo) + "/releases";
 
-    /* Outdated when the published tag differs from the tag this build was
-     * made from.  Builds with no git info cannot tell, so they are treated
-     * as up to date rather than nagging. */
-    const std::string local = build_git_branch();
-    info.outdated = (local == "unknown") ? false : (tag != local);
+    /* Outdated only when the published release is genuinely NEWER than this
+     * build. The version comes from the project() declaration in CMakeLists,
+     * not from git: comparing against the branch name was wrong, since a clone
+     * of the default branch reports "main", which never equals a release tag,
+     * so every build was told an update was available.
+     *
+     * The comparison must also be numeric, not textual. Release tags in this
+     * repo are hand-written and inconsistent -- "1.1Release", "release0.6",
+     * "release" -- so a string inequality (tag != version) both mis-fires on
+     * the newest tag and would nag forever. parse_version() pulls the numbers
+     * out and version_is_newer() compares them, so a build whose version is
+     * equal to or higher than the latest release stays quiet. A build with no
+     * version baked in, or a tag with no parseable number, is treated as up
+     * to date rather than nagging. */
+    const std::string local = build_version();
+    if (local.empty()) {
+        info.outdated = false;
+        return info;
+    }
+
+    const std::vector<int> local_ver = parse_version(local);
+    const std::vector<int> tag_ver   = parse_version(tag);
+    if (local_ver.empty() || tag_ver.empty()) {
+        info.outdated = false;
+        return info;
+    }
+
+    info.outdated = version_is_newer(tag_ver, local_ver);
 
     return info;
 }

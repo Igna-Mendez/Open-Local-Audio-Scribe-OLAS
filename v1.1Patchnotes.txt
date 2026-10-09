@@ -1,3 +1,10 @@
+> **Release tag: `v1.1.1`.** Earlier releases here were tagged `1.1Release`,
+> `release0.6` and `release` — hand-written and not uniform. The update check
+> parses the numbers out of whatever tag it finds, so those still work, but
+> going forward tag releases `vMAJOR.MINOR.PATCH` (e.g. `v1.1.1`, `v1.2.0`).
+> It keeps the check unambiguous and matches the `project(OLAS VERSION ...)`
+> string in `CMakeLists.txt`. Nothing else depends on the tag text.
+
 ## What's new in 1.1
 
 - **A model choice, and two modes.** First run asks whether you want
@@ -5,8 +12,18 @@
   or older machine). Change it any time from **Options**.
 - **Steadier under load.** Transcripts no longer fall behind on long stretches
   of talking, and the app no longer hogs the machine while it works.
+- **Closes cleanly.** Clicking X shuts the program down immediately instead of
+  hanging on a backlog of audio first.
+- **A proper icon**, on the program and on the shortcut it creates.
 - **Starts up faster**, and downloads what it needs automatically.
-- **Update check works now** — it tells you when a newer version is out.
+- **Update check works, and stays quiet.** It used to announce a new version
+  every single time you opened the program, including when you already had the
+  newest one: the check compared the release tag against the git branch name,
+  and "main" never equals a tag. It now compares the actual version numbers,
+  and — because the release tags here are hand-written and not uniform — reads
+  the numbers out of the tag rather than matching the text. It only speaks up
+  when the published release is genuinely newer than your build, so a build
+  that is level with, or ahead of, the latest release stays quiet.
 
 Still two languages side by side, still entirely offline.
 

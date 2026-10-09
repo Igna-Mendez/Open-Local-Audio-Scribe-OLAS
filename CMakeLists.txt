@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(OLAS VERSION 1.1.0 LANGUAGES C CXX)
+project(OLAS VERSION 1.1.1 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -283,6 +283,18 @@ add_executable(olas_win WIN32
     src/update_check.cpp
 )
 
+# Application icon. The .rc attaches OLAS.ico to the executable so Explorer,
+# the taskbar and alt-tab show it. CMake compiles .rc automatically on MSVC;
+# with MinGW the resource compiler has to be told which one to use.
+if(WIN32)
+    target_sources(olas_win PRIVATE src/OLAS.rc)
+    if(NOT MSVC)
+        enable_language(RC)
+        set(CMAKE_RC_COMPILER_INIT windres)
+        set(CMAKE_RC_FLAGS "-I${CMAKE_SOURCE_DIR}/src -I${CMAKE_SOURCE_DIR}")
+    endif()
+endif()
+
 target_include_directories(olas_win PRIVATE
     src
     "${MOONSHINE_INCLUDE_DIR}"
@@ -298,6 +310,7 @@ target_compile_definitions(olas_win PRIVATE
     OLAS_GIT_BRANCH="${OLAS_GIT_BRANCH}"
     OLAS_BUILD_DATE="${OLAS_BUILD_DATE}"
     OLAS_UPDATE_REPO="${OLAS_UPDATE_REPO}"
+    OLAS_VERSION="${PROJECT_VERSION}"
 )
 
 target_link_libraries(olas_win PRIVATE
@@ -387,9 +400,12 @@ add_custom_target(dist
             -DMODELS_SRC=${CMAKE_SOURCE_DIR}/models
             -DDIST_DIR=${DIST_DIR}
             -P ${CMAKE_SOURCE_DIR}/cmake/copy-models.cmake
-    # Launcher + docs
+    # Launcher, icon + docs. The icon ships beside the exe so the .bat can
+    # point at it; the exe already carries its own copy as a resource.
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/OLAS.bat"   "${DIST_DIR}/OLAS.bat"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/OLAS.ico"   "${DIST_DIR}/OLAS.ico"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/README.md"    "${DIST_DIR}/README.md"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different

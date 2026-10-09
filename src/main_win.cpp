@@ -414,7 +414,7 @@ int main() {
             if (info.completed && info.outdated) {
                 win32_ui_show_update_prompt(
                     info.tag_name.c_str(), info.release_name.c_str(),
-                    olas::build_git_branch(), info.html_url.c_str());
+                    olas::build_version(), info.html_url.c_str());
             }
         }).detach();
     }
