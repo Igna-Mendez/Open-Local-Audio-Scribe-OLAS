@@ -20,7 +20,7 @@ current and keeping every word, this program keeps the word.
 > parts got things confidently wrong more than once, and only measurement
 > caught it. Treat the code accordingly: it works, but it has not had a
 > conventional human review.
-
+# You can find the original GNU Linux version here https://github.com/Igna-Mendez/Olas-Linux
 ---
 
 ## What it does
